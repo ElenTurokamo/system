@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS users (
     daily_abs       INTEGER DEFAULT 0,
     daily_chess     INTEGER DEFAULT 0,
     daily_reading   INTEGER DEFAULT 0,
-    reg_state       TEXT DEFAULT 'done' -- FSM-состояние регистрации
+    reg_state       TEXT DEFAULT 'done', -- FSM-состояние регистрации
+    last_reg_message_id INTEGER,         -- id последнего экрана регистрации (для удаления)
+    profile_chat_id     INTEGER,         -- чат, где закреплена сводка профиля
+    profile_message_id  INTEGER          -- id закреплённого сообщения-сводки
 );
 
 CREATE TABLE IF NOT EXISTS challenges (
@@ -54,6 +57,25 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
+        await self._migrate()
+
+    async def _migrate(self):
+        """Добавляет новые колонки в уже существующие БД, не трогая данные."""
+        cur = await self._conn.execute("PRAGMA table_info(users)")
+        existing = {row[1] for row in await cur.fetchall()}
+
+        new_columns = {
+            "last_reg_message_id": "INTEGER",
+            "profile_chat_id": "INTEGER",
+            "profile_message_id": "INTEGER",
+        }
+        changed = False
+        for name, col_type in new_columns.items():
+            if name not in existing:
+                await self._conn.execute(f"ALTER TABLE users ADD COLUMN {name} {col_type}")
+                changed = True
+        if changed:
+            await self._conn.commit()
 
     async def close(self):
         if self._conn:
@@ -111,6 +133,19 @@ class Database:
 
     async def finish_registration(self, user_id: int):
         await self.set_reg_state(user_id, "done")
+
+    async def set_last_reg_message(self, user_id: int, message_id: Optional[int]):
+        await self._conn.execute(
+            "UPDATE users SET last_reg_message_id = ? WHERE user_id = ?", (message_id, user_id)
+        )
+        await self._conn.commit()
+
+    async def set_profile_message(self, user_id: int, chat_id: int, message_id: int):
+        await self._conn.execute(
+            "UPDATE users SET profile_chat_id = ?, profile_message_id = ? WHERE user_id = ?",
+            (chat_id, message_id, user_id),
+        )
+        await self._conn.commit()
 
     async def get_users_by_time(self, time_of_day: str) -> list[dict]:
         cur = await self._conn.execute(

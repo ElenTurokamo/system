@@ -1,4 +1,4 @@
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, Message
 
@@ -6,13 +6,35 @@ from bot import keyboards as kb
 from bot import messages as tx
 from bot.config import FOCUS_OPTIONS, TIME_OF_DAY_LABELS
 from bot.database import db
-from bot.states import Registration
+from bot.registration import finish_registration
 
 router = Router(name="start")
 
+GROUP_INSTRUCTIONS = (
+    "\n\n— Как привязать группу —\n"
+    "1. Создай группу в Telegram (или используй существующую).\n"
+    "2. Добавь этого бота в группу как участника.\n"
+    "3. Бот попытается определить группу автоматически. Если этого не произошло — "
+    "напиши в группе команду /bind_group.\n"
+    "4. Убедись, что у бота есть право отправлять сообщения (и фото) в группе."
+)
+
+
+async def _advance_step(bot: Bot, user_id: int, text: str, reply_markup=None) -> None:
+    """Удаляет предыдущее сообщение-шаг регистрации и отправляет следующий."""
+    user = await db.get_user(user_id)
+    if user and user.get("last_reg_message_id"):
+        try:
+            await bot.delete_message(user_id, user["last_reg_message_id"])
+        except Exception:
+            pass
+
+    msg = await bot.send_message(user_id, text, reply_markup=reply_markup)
+    await db.set_last_reg_message(user_id, msg.message_id)
+
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, bot: Bot):
     user = await db.create_user_if_missing(message.from_user.id, message.from_user.username or "")
 
     if user["reg_state"] == "done":
@@ -21,31 +43,32 @@ async def cmd_start(message: Message):
         )
         return
 
-    await message.answer(tx.registration_welcome())
-    await message.answer(
-        "Во сколько ты хочешь, чтобы Система активировала ежедневное испытание?",
-        reply_markup=kb.time_of_day_kb(),
+    text = (
+        f"{tx.registration_welcome()}\n\n"
+        "Во сколько ты хочешь, чтобы Система активировала ежедневное испытание?"
     )
+    await _advance_step(bot, message.from_user.id, text, kb.time_of_day_kb())
     await db.set_reg_state(message.from_user.id, "time_of_day")
 
 
 @router.callback_query(F.data.startswith("time:"))
-async def on_time_chosen(call: CallbackQuery):
+async def on_time_chosen(call: CallbackQuery, bot: Bot):
     time_key = call.data.split(":", 1)[1]
     await db.set_time_of_day(call.from_user.id, time_key)
     await db.set_reg_state(call.from_user.id, "focus")
 
-    await call.message.edit_text(f"Время испытаний: {TIME_OF_DAY_LABELS[time_key]} ✅")
-    await call.message.answer(
+    text = (
+        f"Время испытаний: {TIME_OF_DAY_LABELS[time_key]} ✅\n\n"
         "Выбери направления, которые Система будет тебе предлагать "
-        "(можно выбрать несколько). Когда закончишь — нажми «Готово».",
-        reply_markup=kb.focus_select_kb([]),
+        "(можно выбрать несколько). Когда закончишь — нажми «Готово»."
     )
+    await _advance_step(bot, call.from_user.id, text, kb.focus_select_kb([]))
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("focus_toggle:"))
 async def on_focus_toggle(call: CallbackQuery):
+    # Тоггл чекбоксов не переводит на следующий шаг — просто обновляем клавиатуру на месте
     focus_key = call.data.split(":", 1)[1]
     selected = await db.toggle_focus(call.from_user.id, focus_key)
     await call.message.edit_reply_markup(reply_markup=kb.focus_select_kb(selected))
@@ -53,48 +76,37 @@ async def on_focus_toggle(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "focus_done")
-async def on_focus_done(call: CallbackQuery):
+async def on_focus_done(call: CallbackQuery, bot: Bot):
     selected = await db.get_focuses(call.from_user.id)
     if not selected:
         await call.answer("Выбери хотя бы одно направление!", show_alert=True)
         return
 
     labels = ", ".join(FOCUS_OPTIONS[f]["label"] for f in selected)
-    await call.message.edit_text(f"Направления сохранены: {labels} ✅")
-
     await db.set_reg_state(call.from_user.id, "group")
-    await call.message.answer(
+
+    text = (
+        f"Направления сохранены: {labels} ✅\n\n"
         "Последний шаг: привяжи бота к группе, чтобы твой прогресс (фото завершённых "
         "испытаний) публиковался туда и вся команда видела твой рост.\n\n"
-        "Можно сделать это сейчас или позже командой /bind_group внутри нужной группы.",
-        reply_markup=kb.group_binding_kb(),
+        "Можно сделать это сейчас или позже командой /bind_group внутри нужной группы."
     )
+    await _advance_step(bot, call.from_user.id, text, kb.group_binding_kb())
     await call.answer()
 
 
 @router.callback_query(F.data == "group_instructions")
 async def group_instructions(call: CallbackQuery):
-    text = (
-        "Как привязать группу:\n\n"
-        "1. Создай группу в Telegram (или используй существующую).\n"
-        "2. Добавь этого бота в группу как участника.\n"
-        "3. Бот попытается определить группу автоматически. Если этого не произошло — "
-        "напиши в группе команду /bind_group, и я привяжу её к твоему профилю.\n"
-        "4. Убедись, что у бота есть право отправлять сообщения (и фото) в группе — "
-        "обычно этого достаточно без прав администратора.\n\n"
-        "После этого сюда, в личные сообщения, ничего дополнительно делать не нужно."
-    )
-    await call.message.answer(text, reply_markup=kb.group_binding_kb())
+    # Инструкции дописываются в то же самое сообщение, а не создают новое
+    current_text = call.message.text or ""
+    if GROUP_INSTRUCTIONS.strip() in current_text:
+        await call.answer()
+        return
+    await call.message.edit_text(current_text + GROUP_INSTRUCTIONS, reply_markup=kb.group_binding_kb())
     await call.answer()
 
 
 @router.callback_query(F.data == "group_skip")
-async def group_skip(call: CallbackQuery):
-    await finish_registration(call)
-
-
-async def finish_registration(call: CallbackQuery):
-    await db.finish_registration(call.from_user.id)
-    await call.message.edit_text("Группа: пропущено (можно привязать позже через /bind_group)")
-    await call.message.answer(tx.registration_done())
+async def group_skip(call: CallbackQuery, bot: Bot):
+    await finish_registration(bot, call.from_user.id)
     await call.answer()

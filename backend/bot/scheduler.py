@@ -6,6 +6,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot import keyboards as kb
 from bot import messages as tx
+from bot import profile
 from bot.config import settings
 from bot.database import db
 
@@ -49,6 +50,8 @@ async def expire_stale_challenges(bot: Bot):
             await bot.send_message(challenge["user_id"], tx.expired())
         except Exception as e:
             logger.warning("Не удалось уведомить об истечении %s: %s", challenge["user_id"], e)
+
+        await profile.sync_profile_message(bot, challenge["user_id"])
 
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:

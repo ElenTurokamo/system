@@ -3,6 +3,7 @@ from aiogram.types import CallbackQuery, Message
 
 from bot import keyboards as kb
 from bot import messages as tx
+from bot import profile
 from bot.config import FOCUS_OPTIONS, XP_PER_CHALLENGE, settings
 from bot.database import db
 
@@ -29,7 +30,7 @@ async def on_focus_picked(call: CallbackQuery):
 
 
 @router.message(F.text.regexp(r"^\d+$"))
-async def on_amount_logged(message: Message):
+async def on_amount_logged(message: Message, bot):
     challenge = await db.get_active_challenge(message.from_user.id)
     if not challenge or challenge["status"] != "in_progress":
         return  # не относится к испытанию - просто число в чате
@@ -57,6 +58,9 @@ async def on_amount_logged(message: Message):
         "Отправь фото, чтобы закрепить прогресс в группе, или нажми «Пропустить фото».",
         reply_markup=kb.photo_prompt_kb(challenge["id"]),
     )
+
+    # Испытание фактически выполнено (счётчики/XP/стрик обновились) - обновляем сводку
+    await profile.sync_profile_message(bot, message.from_user.id)
 
 
 @router.message(F.photo)
@@ -115,4 +119,6 @@ async def on_give_up(call: CallbackQuery):
 
     await call.message.edit_text(call.message.text + "\n\n— 🏳 Испытание прервано —")
     await call.message.answer(tx.give_up(settings.penalty_hours))
+
+    await profile.sync_profile_message(call.bot, call.from_user.id)
     await call.answer()
