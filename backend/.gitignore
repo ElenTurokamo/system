@@ -1,0 +1,61 @@
+# --- Environment / secrets ---
+.env
+*.env
+!.env.example
+
+# --- Database ---
+data_storage/
+*.sqlite3
+*.db
+db.sql
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Logs ---
+*.log
+
+# --- Docker ---
+docker-compose.override.yml
