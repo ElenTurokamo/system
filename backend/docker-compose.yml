@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    container_name: solo_leveling_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data_storage:/app/data   # здесь будет лежать db.sql на хосте
+    environment:
+      - DB_PATH=/app/data/db.sql
