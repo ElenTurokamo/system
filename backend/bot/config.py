@@ -42,37 +42,49 @@ settings = Settings()
 XP_PER_CHALLENGE = 100
 XP_PER_LEVEL = 1000
 
+# Секретный бонус: если довести дисциплину до target * BONUS_MULTIPLIER,
+# начисляется BONUS_LEVELS уровней разом, а дисциплина "запечатывается"
+# (больше нельзя выбрать её фокусом в этом испытании).
+BONUS_MULTIPLIER = 2
+BONUS_LEVELS = 5
+
 # Доступные "фокусы" испытаний. Можно расширять сколько угодно.
+# target — дневная цель по этому фокусу
 FOCUS_OPTIONS = {
     "pushups": {
         "label": "🥊 Отжимания",
         "unit": "раз",
         "counter_field": "daily_pushups",
         "kind": "physical",
+        "target": 50,
     },
     "squats": {
         "label": "🦵 Приседания",
         "unit": "раз",
         "counter_field": "daily_squats",
         "kind": "physical",
+        "target": 50,
     },
     "abs": {
         "label": "🔥 Пресс",
         "unit": "раз",
         "counter_field": "daily_abs",
         "kind": "physical",
+        "target": 50,
     },
     "chess": {
         "label": "♟ Шахматы",
         "unit": "партий",
         "counter_field": "daily_chess",
         "kind": "mental",
+        "target": 5,
     },
     "reading": {
         "label": "📖 Чтение",
         "unit": "страниц",
         "counter_field": "daily_reading",
         "kind": "mental",
+        "target": 20,
     },
 }
 

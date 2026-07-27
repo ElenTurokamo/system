@@ -4,6 +4,7 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from bot import challenge_render
 from bot import keyboards as kb
 from bot import messages as tx
 from bot import profile
@@ -25,16 +26,20 @@ async def dispatch_daily_challenges(bot: Bot, time_of_day: str):
         if not focuses:
             continue
 
-        challenge_id = await db.create_challenge(user["user_id"])
-        text = tx.challenge_start(
+        quest_text = tx.challenge_start(
             streak=user["streak"],
             level=user["level"],
             xp=user["xp"],
             timeout=settings.challenge_timeout_hours,
         )
+        challenge_id = await db.create_challenge(user["user_id"], quest_text, focuses)
+        progress_rows = await db.get_progress_rows(challenge_id)
+
         try:
             msg = await bot.send_message(
-                user["user_id"], text, reply_markup=kb.challenge_kb(challenge_id, focuses)
+                user["user_id"],
+                quest_text,
+                reply_markup=kb.challenge_kb(challenge_id, progress_rows, active_focus=None),
             )
             await db.set_message_id(challenge_id, msg.message_id)
         except Exception as e:
@@ -46,6 +51,8 @@ async def expire_stale_challenges(bot: Bot):
     for challenge in stale:
         await db.expire_challenge(challenge["id"])
         await db.reset_streak(challenge["user_id"])
+
+        await challenge_render.push_challenge_update(bot, challenge["id"])
         try:
             await bot.send_message(challenge["user_id"], tx.expired())
         except Exception as e:

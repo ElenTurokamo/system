@@ -30,11 +30,24 @@ def group_binding_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def challenge_kb(challenge_id: int, focuses: list[str]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=FOCUS_OPTIONS[f]["label"], callback_data=f"focus:{challenge_id}:{f}")]
-        for f in focuses
-    ]
+def challenge_kb(challenge_id: int, progress_rows: list[dict], active_focus: str | None) -> InlineKeyboardMarkup:
+    rows = []
+    for p in progress_rows:
+        opt = FOCUS_OPTIONS[p["focus"]]
+
+        markers = []
+        if p["bonus_claimed"]:
+            markers.append("🔒")
+        elif p["completed"]:
+            markers.append("✅")
+        if p["focus"] == active_focus and not p["bonus_claimed"]:
+            markers.append("🎯")
+
+        prefix = f"{' '.join(markers)} " if markers else ""
+        text = f"{prefix}{opt['label']} {p['amount']}/{p['target']}"
+        rows.append(
+            [InlineKeyboardButton(text=text, callback_data=f"focus:{challenge_id}:{p['focus']}")]
+        )
     rows.append([InlineKeyboardButton(text="🏳 Сдаться", callback_data=f"giveup:{challenge_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

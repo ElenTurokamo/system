@@ -36,13 +36,24 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS challenges (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER,
-    focus           TEXT,
-    status          TEXT,   -- awaiting_focus / in_progress / awaiting_photo / completed / gave_up / expired
+    status          TEXT,   -- awaiting_action / awaiting_photo / completed / gave_up / expired
+    quest_text      TEXT,   -- исходный текст испытания (не меняется, к нему дописывается футер)
+    active_focus    TEXT,   -- какой фокус сейчас выбран (принимает числа)
     started_at      TEXT,
     completed_at    TEXT,
-    amount          INTEGER DEFAULT 0,
     message_id      INTEGER,
     FOREIGN KEY(user_id) REFERENCES users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS challenge_progress (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    challenge_id    INTEGER,
+    focus           TEXT,
+    target          INTEGER,
+    amount          INTEGER DEFAULT 0,
+    completed       INTEGER DEFAULT 0,   -- цель достигнута (amount >= target)
+    bonus_claimed   INTEGER DEFAULT 0,   -- секретный бонус х2 уже получен, дисциплина запечатана
+    FOREIGN KEY(challenge_id) REFERENCES challenges(id)
 );
 """
 
@@ -62,18 +73,31 @@ class Database:
     async def _migrate(self):
         """Добавляет новые колонки в уже существующие БД, не трогая данные."""
         cur = await self._conn.execute("PRAGMA table_info(users)")
-        existing = {row[1] for row in await cur.fetchall()}
+        existing_users = {row[1] for row in await cur.fetchall()}
 
-        new_columns = {
+        new_user_columns = {
             "last_reg_message_id": "INTEGER",
             "profile_chat_id": "INTEGER",
             "profile_message_id": "INTEGER",
         }
         changed = False
-        for name, col_type in new_columns.items():
-            if name not in existing:
+        for name, col_type in new_user_columns.items():
+            if name not in existing_users:
                 await self._conn.execute(f"ALTER TABLE users ADD COLUMN {name} {col_type}")
                 changed = True
+
+        cur = await self._conn.execute("PRAGMA table_info(challenges)")
+        existing_challenges = {row[1] for row in await cur.fetchall()}
+
+        new_challenge_columns = {
+            "quest_text": "TEXT",
+            "active_focus": "TEXT",
+        }
+        for name, col_type in new_challenge_columns.items():
+            if name not in existing_challenges:
+                await self._conn.execute(f"ALTER TABLE challenges ADD COLUMN {name} {col_type}")
+                changed = True
+
         if changed:
             await self._conn.commit()
 
@@ -196,19 +220,30 @@ class Database:
 
     # ---------- challenges ----------
 
-    async def create_challenge(self, user_id: int) -> int:
+    async def create_challenge(self, user_id: int, quest_text: str, focuses: list[str]) -> int:
+        """Создаёт испытание дня и по одной строке прогресса на каждый выбранный фокус."""
         now = datetime.utcnow().isoformat()
         cur = await self._conn.execute(
-            "INSERT INTO challenges (user_id, status, started_at) VALUES (?, 'awaiting_focus', ?)",
-            (user_id, now),
+            """INSERT INTO challenges (user_id, status, quest_text, started_at)
+               VALUES (?, 'awaiting_action', ?, ?)""",
+            (user_id, quest_text, now),
         )
+        challenge_id = cur.lastrowid
+
+        for focus_key in focuses:
+            target = FOCUS_OPTIONS[focus_key]["target"]
+            await self._conn.execute(
+                "INSERT INTO challenge_progress (challenge_id, focus, target) VALUES (?, ?, ?)",
+                (challenge_id, focus_key, target),
+            )
+
         await self._conn.commit()
-        return cur.lastrowid
+        return challenge_id
 
     async def get_active_challenge(self, user_id: int) -> Optional[dict]:
         cur = await self._conn.execute(
             """SELECT * FROM challenges WHERE user_id = ?
-               AND status IN ('awaiting_focus', 'in_progress', 'awaiting_photo')
+               AND status IN ('awaiting_action', 'awaiting_photo')
                ORDER BY id DESC LIMIT 1""",
             (user_id,),
         )
@@ -226,17 +261,15 @@ class Database:
         )
         await self._conn.commit()
 
-    async def set_challenge_focus(self, challenge_id: int, focus_key: str):
+    async def set_active_focus(self, challenge_id: int, focus_key: Optional[str]):
         await self._conn.execute(
-            "UPDATE challenges SET focus = ?, status = 'in_progress' WHERE id = ?",
-            (focus_key, challenge_id),
+            "UPDATE challenges SET active_focus = ? WHERE id = ?", (focus_key, challenge_id)
         )
         await self._conn.commit()
 
-    async def set_challenge_amount(self, challenge_id: int, amount: int):
+    async def set_status(self, challenge_id: int, status: str):
         await self._conn.execute(
-            "UPDATE challenges SET amount = ?, status = 'awaiting_photo' WHERE id = ?",
-            (amount, challenge_id),
+            "UPDATE challenges SET status = ? WHERE id = ?", (status, challenge_id)
         )
         await self._conn.commit()
 
@@ -250,7 +283,7 @@ class Database:
 
     async def give_up_challenge(self, challenge_id: int):
         await self._conn.execute(
-            "UPDATE challenges SET status = 'gave_up', completed_at = ? WHERE id = ?",
+            "UPDATE challenges SET status = 'gave_up', active_focus = NULL, completed_at = ? WHERE id = ?",
             (datetime.utcnow().isoformat(), challenge_id),
         )
         await self._conn.commit()
@@ -259,7 +292,7 @@ class Database:
         cutoff = (datetime.utcnow() - timedelta(hours=timeout_hours)).isoformat()
         cur = await self._conn.execute(
             """SELECT * FROM challenges
-               WHERE status IN ('awaiting_focus', 'in_progress', 'awaiting_photo')
+               WHERE status IN ('awaiting_action', 'awaiting_photo')
                AND started_at < ?""",
             (cutoff,),
         )
@@ -268,9 +301,60 @@ class Database:
 
     async def expire_challenge(self, challenge_id: int):
         await self._conn.execute(
-            "UPDATE challenges SET status = 'expired' WHERE id = ?", (challenge_id,)
+            "UPDATE challenges SET status = 'expired', active_focus = NULL WHERE id = ?",
+            (challenge_id,),
         )
         await self._conn.commit()
+
+    # ---------- challenge progress (per-focus targets) ----------
+
+    async def get_progress_rows(self, challenge_id: int) -> list[dict]:
+        cur = await self._conn.execute(
+            "SELECT * FROM challenge_progress WHERE challenge_id = ? ORDER BY id ASC",
+            (challenge_id,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_progress(self, challenge_id: int, focus_key: str) -> Optional[dict]:
+        cur = await self._conn.execute(
+            "SELECT * FROM challenge_progress WHERE challenge_id = ? AND focus = ?",
+            (challenge_id, focus_key),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def add_progress_amount(self, challenge_id: int, focus_key: str, amount: int) -> dict:
+        """Добавляет подход к прогрессу по фокусу и возвращает обновлённую строку."""
+        await self._conn.execute(
+            """UPDATE challenge_progress SET amount = amount + ?
+               WHERE challenge_id = ? AND focus = ?""",
+            (amount, challenge_id, focus_key),
+        )
+        await self._conn.commit()
+        return await self.get_progress(challenge_id, focus_key)
+
+    async def mark_progress_completed(self, challenge_id: int, focus_key: str):
+        await self._conn.execute(
+            "UPDATE challenge_progress SET completed = 1 WHERE challenge_id = ? AND focus = ?",
+            (challenge_id, focus_key),
+        )
+        await self._conn.commit()
+
+    async def mark_progress_bonus_claimed(self, challenge_id: int, focus_key: str):
+        await self._conn.execute(
+            "UPDATE challenge_progress SET bonus_claimed = 1 WHERE challenge_id = ? AND focus = ?",
+            (challenge_id, focus_key),
+        )
+        await self._conn.commit()
+
+    async def all_progress_completed(self, challenge_id: int) -> bool:
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM challenge_progress WHERE challenge_id = ? AND completed = 0",
+            (challenge_id,),
+        )
+        row = await cur.fetchone()
+        return row["cnt"] == 0
 
 
 db = Database()

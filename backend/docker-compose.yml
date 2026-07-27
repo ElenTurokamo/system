@@ -6,6 +6,6 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data_storage:/app/data_storage   # только для db.sql
+      - ./data_storage:/app/data   # здесь будет лежать db.sql на хосте
     environment:
-      - DB_PATH=/app/data_storage/db.sql
+      - DB_PATH=/app/data/db.sql

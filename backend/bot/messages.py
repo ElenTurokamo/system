@@ -89,3 +89,7 @@ def registration_welcome() -> str:
 
 def registration_done() -> str:
     return f"{_prefix()}\n\n{random.choice(_BANK['registration_done']['templates'])}"
+
+
+def secret_bonus(focus_label: str, levels: int) -> str:
+    return _compose("secret_bonus", focus_label=focus_label, levels=levels)
