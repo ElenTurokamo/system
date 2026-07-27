@@ -15,8 +15,10 @@ async def cmd_profile(message: Message):
         await message.answer("Ты ещё не зарегистрирован. Отправь /start.")
         return
 
-    # /profile просто показывает актуальную закреплённую сводку (создаст, если её нет)
-    await profile.sync_profile_message(message.bot, message.from_user.id)
+    # /profile - явный запрос пользователя, поэтому гарантируем видимость: пересоздаём
+    # сообщение, а не полагаемся на edit (который "успешно" редактирует даже то, что
+    # пользователь мог локально скрыть/очистить у себя в истории).
+    await profile.resend_profile_message(message.bot, message.from_user.id)
 
 
 @router.message(Command("help"))
