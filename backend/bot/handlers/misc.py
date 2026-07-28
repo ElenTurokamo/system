@@ -1,4 +1,4 @@
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -6,6 +6,23 @@ from bot import profile
 from bot.database import db
 
 router = Router(name="misc")
+
+
+@router.message(F.pinned_message, F.chat.type == "private")
+async def on_pin_service_message(message: Message):
+    """
+    Каждое закрепление сообщения Telegram сам добавляет в чат системную запись
+    вида "Бот закрепил сообщение" - это отдельное сообщение со своим message_id,
+    и оно копится точно так же, как обычный текст. Раз это не несёт пользы,
+    удаляем его сразу же, как только оно приходит.
+
+    Ограничено личными чатами: в группах пины могут делать сами админы по своим
+    причинам, не связанным с ботом, - трогать их не нужно.
+    """
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 @router.message(Command("profile"))

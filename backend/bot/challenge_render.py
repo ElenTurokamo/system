@@ -2,48 +2,77 @@
 Единая точка правды для отображения сообщения-испытания.
 
 Сообщение испытания живёт с момента отправки до полного завершения дня
-(все цели выполнены / сдался / истекло время) и всегда РЕДАКТИРУЕТСЯ,
-а не пересоздаётся — это и есть "единая UX архитектура", которую попросили.
+(все цели выполнены и нажато "Завершить испытание" -> фото/пропуск, либо
+"Сдался", либо истекло время) и всегда РЕДАКТИРУЕТСЯ, а не пересоздаётся.
+Новое сообщение отправляется только при диспетчеризации следующего дня.
 """
 import logging
 
 from aiogram import Bot
 
 from bot import keyboards as kb
-from bot.config import FOCUS_OPTIONS
+from bot.config import BONUS_LEVELS, BONUS_MULTIPLIER, FOCUS_OPTIONS, settings
 from bot.database import db
 
 logger = logging.getLogger(__name__)
 
 
-def _build_footer(challenge: dict) -> str:
+def _join(lines: list[str]) -> str:
+    return ("\n\n" + "\n\n".join(lines)) if lines else ""
+
+
+async def _build_footer(challenge: dict) -> str:
     status = challenge["status"]
+    lines: list[str] = []
+
+    if challenge.get("bonus_claimed"):
+        lines.append(
+            f"🎁 Секретный бонус получен: +{BONUS_LEVELS} уровней "
+            f"(все дисциплины доведены до x{BONUS_MULTIPLIER})."
+        )
 
     if status == "awaiting_action":
         if challenge["active_focus"]:
             opt = FOCUS_OPTIONS[challenge["active_focus"]]
-            return f"\n\n➜ {opt['label']}: жду цифру"
-        return ""
+            lines.append(f"➜ {opt['label']}: жду цифру")
+        return _join(lines)
 
     if status == "awaiting_photo":
-        return "\n\n✅ Все цели дня выполнены! Пришли фото или нажми «Пропустить»."
-
-    if status == "gave_up":
-        return "\n\n🏳 Испытание прервано."
-
-    if status == "expired":
-        return "\n\n⌛ Время испытания истекло."
+        lines.append("✅ Все цели дня выполнены!")
+        user = await db.get_user(challenge["user_id"])
+        if user:
+            lines.append(f"🔥 Стрик: {user['streak']} · 🏆 Уровень {user['level']} ({user['xp']} XP)")
+        lines.append("Пришли фото, чтобы закрепить прогресс, или нажми «Пропустить».")
+        return _join(lines)
 
     if status in ("completed", "completed_with_photo"):
-        return "\n\n✅ Испытание завершено."
+        lines.append("✅ Испытание завершено.")
+        user = await db.get_user(challenge["user_id"])
+        if user:
+            lines.append(f"🔥 Стрик: {user['streak']} · 🏆 Уровень {user['level']} ({user['xp']} XP)")
+        if status == "completed_with_photo":
+            lines.append("📸 Фото сохранено.")
+        return _join(lines)
 
-    return ""
+    if status == "gave_up":
+        lines.append(
+            f"🏳 Испытание прервано. Штраф на {settings.penalty_hours}ч: "
+            "без игр, контента 18+ и спонтанных действий."
+        )
+        return _join(lines)
+
+    if status == "expired":
+        lines.append("⌛ Время испытания истекло. Стрик сброшен.")
+        return _join(lines)
+
+    return _join(lines)
 
 
 def _build_keyboard(challenge: dict, progress_rows: list[dict]):
     status = challenge["status"]
     if status == "awaiting_action":
-        return kb.challenge_kb(challenge["id"], progress_rows, challenge["active_focus"])
+        show_finish = bool(progress_rows) and all(p["completed"] for p in progress_rows)
+        return kb.challenge_kb(challenge["id"], progress_rows, challenge["active_focus"], show_finish)
     if status == "awaiting_photo":
         return kb.photo_prompt_kb(challenge["id"])
     return None  # финальные статусы - клавиатура убирается
@@ -56,7 +85,8 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
         return
 
     progress_rows = await db.get_progress_rows(challenge_id)
-    text = (challenge["quest_text"] or "") + _build_footer(challenge)
+    footer = await _build_footer(challenge)
+    text = (challenge["quest_text"] or "") + footer
     markup = _build_keyboard(challenge, progress_rows)
 
     try:

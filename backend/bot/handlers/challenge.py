@@ -4,7 +4,7 @@ from aiogram.types import CallbackQuery, Message
 from bot import challenge_render
 from bot import messages as tx
 from bot import profile
-from bot.config import BONUS_LEVELS, BONUS_MULTIPLIER, FOCUS_OPTIONS, XP_PER_CHALLENGE, XP_PER_LEVEL, settings
+from bot.config import BONUS_LEVELS, BONUS_MULTIPLIER, XP_PER_CHALLENGE, XP_PER_LEVEL, settings
 from bot.database import db
 
 router = Router(name="challenge")
@@ -25,10 +25,7 @@ async def on_focus_picked(call: CallbackQuery):
         await call.answer()
         return
 
-    if progress["bonus_claimed"]:
-        await call.answer("Эта дисциплина запечатана — максимум уже получен сегодня.", show_alert=True)
-        return
-
+    # Дисциплины больше не запечатываются - можно грайндить любую хоть до х2 и дальше
     await db.set_active_focus(challenge_id, focus_key)
     await challenge_render.push_challenge_update(call.bot, challenge_id)
     await call.answer()
@@ -42,7 +39,6 @@ async def on_amount_logged(message: Message):
 
     amount = int(message.text)
     focus_key = challenge["active_focus"]
-    opt = FOCUS_OPTIONS[focus_key]
 
     # Число — это один подход. Сообщение с числом сразу удаляется, весь UX живёт
     # в единственном сообщении испытания.
@@ -55,39 +51,44 @@ async def on_amount_logged(message: Message):
     await db.add_focus_amount(message.from_user.id, focus_key, amount)
 
     progress = await db.add_progress_amount(challenge["id"], focus_key, amount)
-
     if not progress["completed"] and progress["amount"] >= progress["target"]:
         await db.mark_progress_completed(challenge["id"], focus_key)
 
-    # Секретный бонус: довёл дисциплину до x2 цели - мгновенные уровни и печать на дисциплину
-    if not progress["bonus_claimed"] and progress["amount"] >= progress["target"] * BONUS_MULTIPLIER:
-        await db.mark_progress_bonus_claimed(challenge["id"], focus_key)
-        await db.set_active_focus(challenge["id"], None)
-        await db.add_xp(message.from_user.id, XP_PER_LEVEL * BONUS_LEVELS)
-        try:
-            await message.answer(tx.secret_bonus(opt["label"], BONUS_LEVELS))
-        except Exception:
-            pass
+    # Секретный бонус: единоразово за ВСЁ испытание, только когда КАЖДАЯ выбранная
+    # дисциплина доведена минимум до x2 своей цели - не за одну отдельную дисциплину.
+    if not challenge["bonus_claimed"]:
+        rows = await db.get_progress_rows(challenge["id"])
+        if rows and all(r["amount"] >= r["target"] * BONUS_MULTIPLIER for r in rows):
+            await db.mark_challenge_bonus_claimed(challenge["id"])
+            await db.add_xp(message.from_user.id, XP_PER_LEVEL * BONUS_LEVELS)
 
-    # Испытание дня засчитано только когда закрыты ВСЕ цели
-    if await db.all_progress_completed(challenge["id"]):
-        await db.set_active_focus(challenge["id"], None)
-        await db.set_status(challenge["id"], "awaiting_photo")
-
-        xp, level, leveled_up = await db.add_xp(message.from_user.id, XP_PER_CHALLENGE)
-        streak = await db.increment_streak(message.from_user.id)
-
-        try:
-            await message.answer(tx.success(streak, XP_PER_CHALLENGE, xp, level))
-            if leveled_up:
-                await message.answer(tx.level_up(level))
-            if streak % 7 == 0:
-                await message.answer(tx.streak_milestone(streak))
-        except Exception:
-            pass
-
+    # Испытание НЕ завершается автоматически - как только все цели закрыты,
+    # в сообщении появляется кнопка "Завершить испытание". Пока её не нажали,
+    # можно продолжать копить подходы на любой дисциплине (в том числе ради бонуса).
     await challenge_render.push_challenge_update(message.bot, challenge["id"])
     await profile.sync_profile_message(message.bot, message.from_user.id)
+
+
+@router.callback_query(F.data.startswith("finish:"))
+async def on_finish_challenge(call: CallbackQuery):
+    challenge_id = int(call.data.split(":")[1])
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge or challenge["user_id"] != call.from_user.id or challenge["status"] != "awaiting_action":
+        await call.answer("Испытание уже неактуально.", show_alert=True)
+        return
+
+    if not await db.all_progress_completed(challenge_id):
+        await call.answer("Ещё не все цели дня выполнены.", show_alert=True)
+        return
+
+    await db.set_active_focus(challenge_id, None)
+    await db.set_status(challenge_id, "awaiting_photo")
+    await db.add_xp(call.from_user.id, XP_PER_CHALLENGE)
+    await db.increment_streak(call.from_user.id)
+
+    await challenge_render.push_challenge_update(call.bot, challenge_id)
+    await profile.sync_profile_message(call.bot, call.from_user.id)
+    await call.answer()
 
 
 @router.message(F.photo)
@@ -97,23 +98,22 @@ async def on_photo_received(message: Message, bot):
         return
 
     user = await db.get_user(message.from_user.id)
-    await db.complete_challenge(challenge["id"], with_photo=True)
 
+    posted = False
     if user["group_id"]:
         caption = tx.photo_caption(user["streak"], message.from_user.id)
         try:
             await bot.send_photo(user["group_id"], message.photo[-1].file_id, caption=caption)
-            await message.answer("Фото опубликовано в группе ✅")
+            posted = True
         except Exception:
-            await message.answer(
-                "Не получилось отправить фото в группу (возможно, бот был удалён из неё). "
-                "Но твой прогресс уже сохранён."
-            )
-    else:
-        await message.answer(
-            "Прогресс сохранён, но группа не привязана — фото никуда не опубликовано. "
-            "Привязать группу можно командой /bind_group внутри неё."
-        )
+            posted = False  # тихо - итоговый статус виден в самом сообщении испытания
+
+    await db.complete_challenge(challenge["id"], with_photo=posted)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
     await challenge_render.push_challenge_update(bot, challenge["id"])
 
@@ -128,7 +128,7 @@ async def on_skip_photo(call: CallbackQuery):
 
     await db.complete_challenge(challenge_id, with_photo=False)
     await challenge_render.push_challenge_update(call.bot, challenge_id)
-    await call.answer("Испытание завершено без фото ✅")
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("giveup:"))
@@ -147,10 +147,5 @@ async def on_give_up(call: CallbackQuery):
     await db.set_penalty(call.from_user.id, settings.penalty_hours)
 
     await challenge_render.push_challenge_update(call.bot, challenge_id)
-    try:
-        await call.message.answer(tx.give_up(settings.penalty_hours))
-    except Exception:
-        pass
-
     await profile.sync_profile_message(call.bot, call.from_user.id)
     await call.answer()

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS challenges (
     status          TEXT,   -- awaiting_action / awaiting_photo / completed / gave_up / expired
     quest_text      TEXT,   -- исходный текст испытания (не меняется, к нему дописывается футер)
     active_focus    TEXT,   -- какой фокус сейчас выбран (принимает числа)
+    bonus_claimed   INTEGER DEFAULT 0,  -- секретный бонус х2 (на ВСЕ дисциплины сразу) получен
     started_at      TEXT,
     completed_at    TEXT,
     message_id      INTEGER,
@@ -92,6 +93,7 @@ class Database:
         new_challenge_columns = {
             "quest_text": "TEXT",
             "active_focus": "TEXT",
+            "bonus_claimed": "INTEGER DEFAULT 0",
         }
         for name, col_type in new_challenge_columns.items():
             if name not in existing_challenges:
@@ -273,6 +275,12 @@ class Database:
         )
         await self._conn.commit()
 
+    async def mark_challenge_bonus_claimed(self, challenge_id: int):
+        await self._conn.execute(
+            "UPDATE challenges SET bonus_claimed = 1 WHERE id = ?", (challenge_id,)
+        )
+        await self._conn.commit()
+
     async def complete_challenge(self, challenge_id: int, with_photo: bool):
         status = "completed_with_photo" if with_photo else "completed"
         await self._conn.execute(
@@ -337,13 +345,6 @@ class Database:
     async def mark_progress_completed(self, challenge_id: int, focus_key: str):
         await self._conn.execute(
             "UPDATE challenge_progress SET completed = 1 WHERE challenge_id = ? AND focus = ?",
-            (challenge_id, focus_key),
-        )
-        await self._conn.commit()
-
-    async def mark_progress_bonus_claimed(self, challenge_id: int, focus_key: str):
-        await self._conn.execute(
-            "UPDATE challenge_progress SET bonus_claimed = 1 WHERE challenge_id = ? AND focus = ?",
             (challenge_id, focus_key),
         )
         await self._conn.commit()
