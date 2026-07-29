@@ -2,6 +2,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
+from bot import challenge_render
 from bot import keyboards as kb
 from bot import messages as tx
 from bot.config import FOCUS_OPTIONS, time_of_day_label
@@ -55,6 +56,13 @@ async def cmd_start(message: Message, bot: Bot):
             "Ты уже зарегистрирован, Игрок. Используй /profile, чтобы посмотреть статистику, "
             "/change_time — сменить время испытаний, /change_focus — сменить дисциплины."
         )
+
+        # Если сегодняшнее испытание уже создано, но старое сообщение с ним недоступно
+        # (например, пользователь очистил чат) - пересылаем его новым сообщением,
+        # иначе испытание "теряется" и push_challenge_update тихо редактирует пустоту.
+        active_challenge = await db.get_active_challenge(message.from_user.id)
+        if active_challenge:
+            await challenge_render.resend_challenge_message(bot, active_challenge["id"])
         return
 
     text = (

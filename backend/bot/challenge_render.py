@@ -109,3 +109,25 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
         )
     except Exception as e:
         logger.info("Не удалось обновить сообщение испытания %s: %s", challenge_id, e)
+
+
+async def resend_challenge_message(bot: Bot, challenge_id: int):
+    """
+    Отправляет актуальное состояние испытания НОВЫМ сообщением и переносит на него
+    "точку правды" (message_id в БД), по которой дальше будет работать push_challenge_update.
+
+    Нужно для случаев, когда старое сообщение недоступно пользователю (например, он
+    очистил историю чата) - иначе push_challenge_update продолжал бы молча редактировать
+    сообщение, которое пользователь уже не видит.
+    """
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge:
+        return
+
+    progress_rows = await db.get_progress_rows(challenge_id)
+    footer = await _build_footer(challenge, progress_rows)
+    text = (challenge["quest_text"] or "") + footer
+    markup = _build_keyboard(challenge, progress_rows)
+
+    msg = await bot.send_message(challenge["user_id"], text, reply_markup=markup)
+    await db.set_message_id(challenge_id, msg.message_id)
