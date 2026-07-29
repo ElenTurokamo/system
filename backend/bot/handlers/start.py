@@ -1,10 +1,10 @@
 from aiogram import Bot, F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 from bot import keyboards as kb
 from bot import messages as tx
-from bot.config import FOCUS_OPTIONS, TIME_OF_DAY_LABELS
+from bot.config import FOCUS_OPTIONS, time_of_day_label
 from bot.database import db
 from bot.registration import finish_registration
 
@@ -21,7 +21,7 @@ GROUP_INSTRUCTIONS = (
 
 
 async def _advance_step(bot: Bot, user_id: int, text: str, reply_markup=None) -> None:
-    """Удаляет предыдущее сообщение-шаг регистрации и отправляет следующий."""
+    """Удаляет предыдущее служебное сообщение (шаг регистрации/настроек) и отправляет следующее."""
     user = await db.get_user(user_id)
     if user and user.get("last_reg_message_id"):
         try:
@@ -33,13 +33,27 @@ async def _advance_step(bot: Bot, user_id: int, text: str, reply_markup=None) ->
     await db.set_last_reg_message(user_id, msg.message_id)
 
 
+async def _close_step(bot: Bot, user_id: int) -> None:
+    """Закрывает текущее служебное сообщение без открытия следующего шага."""
+    user = await db.get_user(user_id)
+    if user and user.get("last_reg_message_id"):
+        try:
+            await bot.delete_message(user_id, user["last_reg_message_id"])
+        except Exception:
+            pass
+        await db.set_last_reg_message(user_id, None)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
-    user = await db.create_user_if_missing(message.from_user.id, message.from_user.username or "")
+    user = await db.create_user_if_missing(
+        message.from_user.id, message.from_user.username or "", message.from_user.first_name or ""
+    )
 
     if user["reg_state"] == "done":
         await message.answer(
-            "Ты уже зарегистрирован, Игрок. Используй /profile, чтобы посмотреть статистику."
+            "Ты уже зарегистрирован, Игрок. Используй /profile, чтобы посмотреть статистику, "
+            "/change_time — сменить время испытаний, /change_focus — сменить дисциплины."
         )
         return
 
@@ -51,14 +65,47 @@ async def cmd_start(message: Message, bot: Bot):
     await db.set_reg_state(message.from_user.id, "time_of_day")
 
 
+@router.message(Command("change_time"))
+async def cmd_change_time(message: Message, bot: Bot):
+    user = await db.get_user(message.from_user.id)
+    if not user or user["reg_state"] != "done":
+        await message.answer("Сначала пройди регистрацию: /start")
+        return
+
+    text = "Во сколько присылать ежедневное испытание?"
+    await _advance_step(bot, message.from_user.id, text, kb.time_of_day_kb())
+
+
+@router.message(Command("change_focus"))
+async def cmd_change_focus(message: Message, bot: Bot):
+    user = await db.get_user(message.from_user.id)
+    if not user or user["reg_state"] != "done":
+        await message.answer("Сначала пройди регистрацию: /start")
+        return
+
+    selected = await db.get_focuses(message.from_user.id)
+    text = (
+        "Выбери дисциплины, которые Система будет тебе предлагать. "
+        "Когда закончишь — нажми «Готово»."
+    )
+    await _advance_step(bot, message.from_user.id, text, kb.focus_select_kb(selected))
+
+
 @router.callback_query(F.data.startswith("time:"))
 async def on_time_chosen(call: CallbackQuery, bot: Bot):
     time_key = call.data.split(":", 1)[1]
+    user = await db.get_user(call.from_user.id)
     await db.set_time_of_day(call.from_user.id, time_key)
-    await db.set_reg_state(call.from_user.id, "focus")
 
+    if user and user["reg_state"] == "done":
+        # Это смена настроек командой /change_time, а не первичная регистрация
+        await _close_step(bot, call.from_user.id)
+        await call.answer(f"Время обновлено: {time_of_day_label(time_key)} ✅")
+        return
+
+    await db.set_reg_state(call.from_user.id, "focus")
     text = (
-        f"Время испытаний: {TIME_OF_DAY_LABELS[time_key]} ✅\n\n"
+        f"Время испытаний: {time_of_day_label(time_key)} ✅\n\n"
         "Выбери направления, которые Система будет тебе предлагать "
         "(можно выбрать несколько). Когда закончишь — нажми «Готово»."
     )
@@ -80,6 +127,13 @@ async def on_focus_done(call: CallbackQuery, bot: Bot):
     selected = await db.get_focuses(call.from_user.id)
     if not selected:
         await call.answer("Выбери хотя бы одно направление!", show_alert=True)
+        return
+
+    user = await db.get_user(call.from_user.id)
+    if user and user["reg_state"] == "done":
+        # Это смена настроек командой /change_focus, а не первичная регистрация
+        await _close_step(bot, call.from_user.id)
+        await call.answer("Дисциплины обновлены ✅")
         return
 
     labels = ", ".join(FOCUS_OPTIONS[f]["label"] for f in selected)

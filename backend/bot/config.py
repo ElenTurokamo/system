@@ -42,9 +42,8 @@ settings = Settings()
 XP_PER_CHALLENGE = 100
 XP_PER_LEVEL = 1000
 
-# Секретный бонус: если довести дисциплину до target * BONUS_MULTIPLIER,
-# начисляется BONUS_LEVELS уровней разом, а дисциплина "запечатывается"
-# (больше нельзя выбрать её фокусом в этом испытании).
+# Секретный бонус: если ВСЕ выбранные дисциплины довести до target * BONUS_MULTIPLIER,
+# начисляется BONUS_LEVELS уровней разом (один раз за испытание).
 BONUS_MULTIPLIER = 2
 BONUS_LEVELS = 5
 
@@ -94,3 +93,8 @@ TIME_OF_DAY_LABELS = {
     "evening": "🌇 Вечером",
     "night": "🌙 Ночью",
 }
+
+
+def time_of_day_label(key: str) -> str:
+    """Метка времени суток вместе с точным временем отправки, например '🌅 Утром (05:00)'."""
+    return f"{TIME_OF_DAY_LABELS[key]} ({settings.time_slots[key]})"

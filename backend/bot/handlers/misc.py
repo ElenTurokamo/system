@@ -1,11 +1,17 @@
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
 from bot import profile
 from bot.database import db
 
 router = Router(name="misc")
+
+
+@router.callback_query(F.data == "noop")
+async def noop_callback(call: CallbackQuery):
+    """Кнопки-разделители (заголовки групп дисциплин) ни на что не реагируют."""
+    await call.answer()
 
 
 @router.message(F.pinned_message, F.chat.type == "private")
@@ -43,6 +49,8 @@ async def cmd_help(message: Message):
     await message.answer(
         "/start — регистрация\n"
         "/profile — обновить и показать закреплённую сводку профиля\n"
+        "/change_time — сменить время ежедневного испытания\n"
+        "/change_focus — сменить дисциплины испытаний\n"
         "/bind_group — привязать текущую группу (вызывать внутри группы)\n"
         "/group_id — узнать ID текущей группы"
     )

@@ -11,10 +11,38 @@ from datetime import datetime
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.config import TIME_OF_DAY_LABELS, XP_PER_LEVEL
+from bot.config import time_of_day_label, XP_PER_LEVEL
 from bot.database import db
 
 logger = logging.getLogger(__name__)
+
+
+def ru_days(n: int) -> str:
+    """Правильное склонение слова 'день' для русского языка: 1 день, 2 дня, 5 дней и т.п."""
+    n_abs = abs(n)
+    if n_abs % 10 == 1 and n_abs % 100 != 11:
+        return "день"
+    if n_abs % 10 in (2, 3, 4) and n_abs % 100 not in (12, 13, 14):
+        return "дня"
+    return "дней"
+
+
+def player_code(user: dict) -> str:
+    """
+    Уникальный короткий код игрока: дата регистрации (ГГММДД) + первые 5 цифр ID.
+    Например, зарегистрировался 28.07.2026, ID 987654321 -> 260728-98765.
+    """
+    try:
+        registered = datetime.fromisoformat(user["registered_at"])
+        date_part = registered.strftime("%y%m%d")
+    except (TypeError, ValueError):
+        date_part = "000000"
+    id_part = str(user["user_id"])[:5]
+    return f"{date_part}-{id_part}"
+
+
+def display_name(user: dict) -> str:
+    return user.get("first_name") or user.get("username") or f"Игрок {user['user_id']}"
 
 
 def render_profile_text(user: dict) -> str:
@@ -25,25 +53,28 @@ def render_profile_text(user: dict) -> str:
             penalty_line = f"\n🚫 Штраф активен до {until.strftime('%Y-%m-%d %H:%M UTC')}"
 
     xp_into_level = user["xp"] % XP_PER_LEVEL
-    time_label = TIME_OF_DAY_LABELS.get(user["time_of_day"], "—")
+    time_label = time_of_day_label(user["time_of_day"]) if user["time_of_day"] else "—"
     group_line = "да ✅" if user["group_id"] else "нет (напиши /bind_group в группе)"
+    streak = user["streak"]
 
-    return (
+    header = (
         "『Профиль Игрока』\n\n"
-        f"🆔 ID: <code>{user['user_id']}</code>\n"
+        f"🆔 {display_name(user)} · #{player_code(user)}\n"
         f"🏆 Уровень: {user['level']} ({xp_into_level}/{XP_PER_LEVEL} XP)\n"
-        f"✨ Всего опыта: {user['xp']} XP\n"
-        f"🔥 Стрик: {user['streak']} дней\n"
+        f"🔥 Серия: {streak} {ru_days(streak)}\n"
         f"⏰ Время испытаний: {time_label}\n"
-        f"👥 Группа привязана: {group_line}\n\n"
+        f"👥 Группа привязана: {group_line}"
+    )
+
+    stats = (
         f"🥊 Отжимания: {user['daily_pushups']}\n"
         f"🦵 Приседания: {user['daily_squats']}\n"
         f"🔥 Пресс: {user['daily_abs']}\n"
         f"♟ Шахматы (партий): {user['daily_chess']}\n"
         f"📖 Чтение (страниц): {user['daily_reading']}"
-        f"{penalty_line}\n\n"
-        f"<i>Обновлено: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</i>"
     )
+
+    return f"{header}\n\n{stats}{penalty_line}"
 
 
 async def sync_profile_message(bot: Bot, user_id: int):

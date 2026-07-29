@@ -2,9 +2,13 @@
 Единая точка правды для отображения сообщения-испытания.
 
 Сообщение испытания живёт с момента отправки до полного завершения дня
-(все цели выполнены и нажато "Завершить испытание" -> фото/пропуск, либо
-"Сдался", либо истекло время) и всегда РЕДАКТИРУЕТСЯ, а не пересоздаётся.
-Новое сообщение отправляется только при диспетчеризации следующего дня.
+(все цели выполнены и нажато "Завершить испытание", либо "Сдался", либо
+истекло время) и всегда РЕДАКТИРУЕТСЯ, а не пересоздаётся. Новое сообщение
+отправляется только при диспетчеризации следующего дня.
+
+Фото для физических дисциплин запрашивается СРАЗУ, как только все физические
+цели закрыты (не дожидаясь интеллектуальных) - см. _physical_photo_pending.
+Для чисто интеллектуальных испытаний фото не запрашивается вовсе.
 """
 import logging
 
@@ -21,7 +25,15 @@ def _join(lines: list[str]) -> str:
     return ("\n\n" + "\n\n".join(lines)) if lines else ""
 
 
-async def _build_footer(challenge: dict) -> str:
+def _physical_photo_pending(challenge: dict, progress_rows: list[dict]) -> bool:
+    """Все физические цели закрыты, а фото по ним ещё не отправлено/пропущено."""
+    if challenge["physical_photo_done"]:
+        return False
+    physical_rows = [r for r in progress_rows if FOCUS_OPTIONS[r["focus"]]["kind"] == "physical"]
+    return bool(physical_rows) and all(r["completed"] for r in physical_rows)
+
+
+async def _build_footer(challenge: dict, progress_rows: list[dict]) -> str:
     status = challenge["status"]
     lines: list[str] = []
 
@@ -32,17 +44,14 @@ async def _build_footer(challenge: dict) -> str:
         )
 
     if status == "awaiting_action":
+        if _physical_photo_pending(challenge, progress_rows):
+            lines.append(
+                "💪 Физическая часть выполнена! Пришли фото, чтобы зафиксировать "
+                "результат в группе, или нажми «Пропустить фото»."
+            )
         if challenge["active_focus"]:
             opt = FOCUS_OPTIONS[challenge["active_focus"]]
             lines.append(f"➜ {opt['label']}: жду цифру")
-        return _join(lines)
-
-    if status == "awaiting_photo":
-        lines.append("✅ Все цели дня выполнены!")
-        user = await db.get_user(challenge["user_id"])
-        if user:
-            lines.append(f"🔥 Стрик: {user['streak']} · 🏆 Уровень {user['level']} ({user['xp']} XP)")
-        lines.append("Пришли фото, чтобы закрепить прогресс, или нажми «Пропустить».")
         return _join(lines)
 
     if status in ("completed", "completed_with_photo"):
@@ -70,12 +79,14 @@ async def _build_footer(challenge: dict) -> str:
 
 def _build_keyboard(challenge: dict, progress_rows: list[dict]):
     status = challenge["status"]
-    if status == "awaiting_action":
-        show_finish = bool(progress_rows) and all(p["completed"] for p in progress_rows)
-        return kb.challenge_kb(challenge["id"], progress_rows, challenge["active_focus"], show_finish)
-    if status == "awaiting_photo":
-        return kb.photo_prompt_kb(challenge["id"])
-    return None  # финальные статусы - клавиатура убирается
+    if status != "awaiting_action":
+        return None  # финальные статусы - клавиатура убирается
+
+    show_finish = bool(progress_rows) and all(p["completed"] for p in progress_rows)
+    show_skip_photo = _physical_photo_pending(challenge, progress_rows)
+    return kb.challenge_kb(
+        challenge["id"], progress_rows, challenge["active_focus"], show_finish, show_skip_photo
+    )
 
 
 async def push_challenge_update(bot: Bot, challenge_id: int):
@@ -85,7 +96,7 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
         return
 
     progress_rows = await db.get_progress_rows(challenge_id)
-    footer = await _build_footer(challenge)
+    footer = await _build_footer(challenge, progress_rows)
     text = (challenge["quest_text"] or "") + footer
     markup = _build_keyboard(challenge, progress_rows)
 

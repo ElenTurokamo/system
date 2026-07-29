@@ -4,7 +4,7 @@ from aiogram.types import CallbackQuery, Message
 from bot import challenge_render
 from bot import messages as tx
 from bot import profile
-from bot.config import BONUS_LEVELS, BONUS_MULTIPLIER, XP_PER_CHALLENGE, XP_PER_LEVEL, settings
+from bot.config import BONUS_LEVELS, BONUS_MULTIPLIER, FOCUS_OPTIONS, XP_PER_CHALLENGE, XP_PER_LEVEL, settings
 from bot.database import db
 
 router = Router(name="challenge")
@@ -25,7 +25,7 @@ async def on_focus_picked(call: CallbackQuery):
         await call.answer()
         return
 
-    # Дисциплины больше не запечатываются - можно грайндить любую хоть до х2 и дальше
+    # Дисциплины не запечатываются - можно грайндить любую хоть до х2 и дальше
     await db.set_active_focus(challenge_id, focus_key)
     await challenge_render.push_challenge_update(call.bot, challenge_id)
     await call.answer()
@@ -34,7 +34,7 @@ async def on_focus_picked(call: CallbackQuery):
 @router.message(F.text.regexp(r"^\d+$"))
 async def on_amount_logged(message: Message):
     challenge = await db.get_active_challenge(message.from_user.id)
-    if not challenge or challenge["status"] != "awaiting_action" or not challenge["active_focus"]:
+    if not challenge or not challenge["active_focus"]:
         return  # число не относится ни к одному активному испытанию - не трогаем сообщение
 
     amount = int(message.text)
@@ -62,11 +62,60 @@ async def on_amount_logged(message: Message):
             await db.mark_challenge_bonus_claimed(challenge["id"])
             await db.add_xp(message.from_user.id, XP_PER_LEVEL * BONUS_LEVELS)
 
-    # Испытание НЕ завершается автоматически - как только все цели закрыты,
-    # в сообщении появляется кнопка "Завершить испытание". Пока её не нажали,
-    # можно продолжать копить подходы на любой дисциплине (в том числе ради бонуса).
+    # Испытание НЕ завершается автоматически: как только все цели закрыты, в сообщении
+    # появляется кнопка "Завершить испытание". Пока её не нажали, можно продолжать
+    # копить подходы на любой дисциплине (в том числе ради секретного бонуса).
     await challenge_render.push_challenge_update(message.bot, challenge["id"])
     await profile.sync_profile_message(message.bot, message.from_user.id)
+
+
+@router.message(F.photo)
+async def on_photo_received(message: Message, bot):
+    """
+    Фото запрашивается СРАЗУ, как только закрыты все физические цели дня -
+    не дожидаясь интеллектуальных и не дожидаясь нажатия "Завершить испытание".
+    Для чисто интеллектуальных испытаний это сообщение просто ни на что не среагирует.
+    """
+    challenge = await db.get_active_challenge(message.from_user.id)
+    if not challenge or challenge["physical_photo_done"]:
+        return
+
+    progress_rows = await db.get_progress_rows(challenge["id"])
+    physical_rows = [r for r in progress_rows if FOCUS_OPTIONS[r["focus"]]["kind"] == "physical"]
+    if not physical_rows or not all(r["completed"] for r in physical_rows):
+        return  # фото сейчас не ожидается
+
+    user = await db.get_user(message.from_user.id)
+    posted = False
+    if user["group_id"]:
+        caption = tx.photo_caption(user["streak"], message.from_user.id)
+        try:
+            await bot.send_photo(user["group_id"], message.photo[-1].file_id, caption=caption)
+            posted = True
+        except Exception:
+            posted = False  # тихо - итоговый статус виден в самом сообщении испытания
+
+    await db.mark_physical_photo(challenge["id"], posted=posted)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await challenge_render.push_challenge_update(bot, challenge["id"])
+
+
+@router.callback_query(F.data.startswith("skipphysicalphoto:"))
+async def on_skip_physical_photo(call: CallbackQuery):
+    challenge_id = int(call.data.split(":")[1])
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge or challenge["user_id"] != call.from_user.id or challenge["status"] != "awaiting_action":
+        await call.answer()
+        return
+
+    await db.mark_physical_photo(challenge_id, posted=False)
+    await challenge_render.push_challenge_update(call.bot, challenge_id)
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("finish:"))
@@ -82,52 +131,12 @@ async def on_finish_challenge(call: CallbackQuery):
         return
 
     await db.set_active_focus(challenge_id, None)
-    await db.set_status(challenge_id, "awaiting_photo")
     await db.add_xp(call.from_user.id, XP_PER_CHALLENGE)
     await db.increment_streak(call.from_user.id)
+    await db.complete_challenge(challenge_id, with_photo=bool(challenge["physical_photo_posted"]))
 
     await challenge_render.push_challenge_update(call.bot, challenge_id)
     await profile.sync_profile_message(call.bot, call.from_user.id)
-    await call.answer()
-
-
-@router.message(F.photo)
-async def on_photo_received(message: Message, bot):
-    challenge = await db.get_active_challenge(message.from_user.id)
-    if not challenge or challenge["status"] != "awaiting_photo":
-        return
-
-    user = await db.get_user(message.from_user.id)
-
-    posted = False
-    if user["group_id"]:
-        caption = tx.photo_caption(user["streak"], message.from_user.id)
-        try:
-            await bot.send_photo(user["group_id"], message.photo[-1].file_id, caption=caption)
-            posted = True
-        except Exception:
-            posted = False  # тихо - итоговый статус виден в самом сообщении испытания
-
-    await db.complete_challenge(challenge["id"], with_photo=posted)
-
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    await challenge_render.push_challenge_update(bot, challenge["id"])
-
-
-@router.callback_query(F.data.startswith("skipphoto:"))
-async def on_skip_photo(call: CallbackQuery):
-    challenge_id = int(call.data.split(":")[1])
-    challenge = await db.get_challenge(challenge_id)
-    if not challenge or challenge["user_id"] != call.from_user.id:
-        await call.answer()
-        return
-
-    await db.complete_challenge(challenge_id, with_photo=False)
-    await challenge_render.push_challenge_update(call.bot, challenge_id)
     await call.answer()
 
 

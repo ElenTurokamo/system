@@ -14,6 +14,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id         INTEGER PRIMARY KEY,
     username        TEXT,
+    first_name      TEXT,
     registered_at   TEXT,
     time_of_day     TEXT,               -- morning / day / evening / night
     focuses         TEXT DEFAULT '[]',  -- JSON-список ключей из FOCUS_OPTIONS
@@ -28,7 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
     daily_chess     INTEGER DEFAULT 0,
     daily_reading   INTEGER DEFAULT 0,
     reg_state       TEXT DEFAULT 'done', -- FSM-состояние регистрации
-    last_reg_message_id INTEGER,         -- id последнего экрана регистрации (для удаления)
+    last_reg_message_id INTEGER,         -- id последнего служебного/шагового сообщения (для удаления)
     profile_chat_id     INTEGER,         -- чат, где закреплена сводка профиля
     profile_message_id  INTEGER          -- id закреплённого сообщения-сводки
 );
@@ -36,10 +37,12 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS challenges (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id         INTEGER,
-    status          TEXT,   -- awaiting_action / awaiting_photo / completed / gave_up / expired
+    status          TEXT,   -- awaiting_action / completed / completed_with_photo / gave_up / expired
     quest_text      TEXT,   -- исходный текст испытания (не меняется, к нему дописывается футер)
     active_focus    TEXT,   -- какой фокус сейчас выбран (принимает числа)
     bonus_claimed   INTEGER DEFAULT 0,  -- секретный бонус х2 (на ВСЕ дисциплины сразу) получен
+    physical_photo_done   INTEGER DEFAULT 0,  -- фото по физической части отправлено/пропущено
+    physical_photo_posted INTEGER DEFAULT 0,  -- фото реально ушло в группу
     started_at      TEXT,
     completed_at    TEXT,
     message_id      INTEGER,
@@ -77,6 +80,7 @@ class Database:
         existing_users = {row[1] for row in await cur.fetchall()}
 
         new_user_columns = {
+            "first_name": "TEXT",
             "last_reg_message_id": "INTEGER",
             "profile_chat_id": "INTEGER",
             "profile_message_id": "INTEGER",
@@ -94,6 +98,8 @@ class Database:
             "quest_text": "TEXT",
             "active_focus": "TEXT",
             "bonus_claimed": "INTEGER DEFAULT 0",
+            "physical_photo_done": "INTEGER DEFAULT 0",
+            "physical_photo_posted": "INTEGER DEFAULT 0",
         }
         for name, col_type in new_challenge_columns.items():
             if name not in existing_challenges:
@@ -114,13 +120,14 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
-    async def create_user_if_missing(self, user_id: int, username: str):
+    async def create_user_if_missing(self, user_id: int, username: str, first_name: str = ""):
         existing = await self.get_user(user_id)
         if existing:
             return existing
         await self._conn.execute(
-            "INSERT INTO users (user_id, username, registered_at, reg_state) VALUES (?, ?, ?, 'time_of_day')",
-            (user_id, username, datetime.utcnow().isoformat()),
+            """INSERT INTO users (user_id, username, first_name, registered_at, reg_state)
+               VALUES (?, ?, ?, ?, 'time_of_day')""",
+            (user_id, username, first_name, datetime.utcnow().isoformat()),
         )
         await self._conn.commit()
         return await self.get_user(user_id)
@@ -245,7 +252,7 @@ class Database:
     async def get_active_challenge(self, user_id: int) -> Optional[dict]:
         cur = await self._conn.execute(
             """SELECT * FROM challenges WHERE user_id = ?
-               AND status IN ('awaiting_action', 'awaiting_photo')
+               AND status = 'awaiting_action'
                ORDER BY id DESC LIMIT 1""",
             (user_id,),
         )
@@ -281,6 +288,13 @@ class Database:
         )
         await self._conn.commit()
 
+    async def mark_physical_photo(self, challenge_id: int, posted: bool):
+        await self._conn.execute(
+            "UPDATE challenges SET physical_photo_done = 1, physical_photo_posted = ? WHERE id = ?",
+            (int(posted), challenge_id),
+        )
+        await self._conn.commit()
+
     async def complete_challenge(self, challenge_id: int, with_photo: bool):
         status = "completed_with_photo" if with_photo else "completed"
         await self._conn.execute(
@@ -300,7 +314,7 @@ class Database:
         cutoff = (datetime.utcnow() - timedelta(hours=timeout_hours)).isoformat()
         cur = await self._conn.execute(
             """SELECT * FROM challenges
-               WHERE status IN ('awaiting_action', 'awaiting_photo')
+               WHERE status = 'awaiting_action'
                AND started_at < ?""",
             (cutoff,),
         )
