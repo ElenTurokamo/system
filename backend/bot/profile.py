@@ -11,7 +11,7 @@ from datetime import datetime
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.config import level_from_total_xp, time_of_day_label
+from bot.config import FOCUS_OPTIONS, level_from_total_xp, time_of_day_label
 from bot.database import db
 
 logger = logging.getLogger(__name__)
@@ -67,11 +67,11 @@ def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claime
     )
 
     stats = (
-        f"🥊 Отжимания: {user['daily_pushups']}\n"
-        f"🦵 Приседания: {user['daily_squats']}\n"
-        f"🔥 Пресс: {user['daily_abs']}\n"
-        f"♟ Шахматы (партий): {user['daily_chess']}\n"
-        f"📖 Чтение (страниц): {user['daily_reading']}"
+        f"{FOCUS_OPTIONS['pushups']['label']}: {user['daily_pushups']}\n"
+        f"{FOCUS_OPTIONS['squats']['label']}: {user['daily_squats']}\n"
+        f"{FOCUS_OPTIONS['abs']['label']}: {user['daily_abs']}\n"
+        f"{FOCUS_OPTIONS['chess']['label']} (партий): {user['daily_chess']}\n"
+        f"{FOCUS_OPTIONS['reading']['label']} (страниц): {user['daily_reading']}"
     )
 
     text = f"{header}\n\n{stats}{penalty_line}"
