@@ -4,7 +4,14 @@ from aiogram.types import CallbackQuery, Message
 from bot import challenge_render
 from bot import messages as tx
 from bot import profile
-from bot.config import BONUS_LEVELS, BONUS_MULTIPLIER, FOCUS_OPTIONS, XP_PER_CHALLENGE, XP_PER_LEVEL, settings
+from bot.config import (
+    BONUS_LEVELS,
+    BONUS_MULTIPLIER,
+    FOCUS_OPTIONS,
+    settings,
+    xp_for_n_levels,
+    xp_reward_for_challenge,
+)
 from bot.database import db
 
 router = Router(name="challenge")
@@ -60,7 +67,9 @@ async def on_amount_logged(message: Message):
         rows = await db.get_progress_rows(challenge["id"])
         if rows and all(r["amount"] >= r["target"] * BONUS_MULTIPLIER for r in rows):
             await db.mark_challenge_bonus_claimed(challenge["id"])
-            await db.add_xp(message.from_user.id, XP_PER_LEVEL * BONUS_LEVELS)
+            user = await db.get_user(message.from_user.id)
+            bonus_xp = xp_for_n_levels(user["level"], BONUS_LEVELS)
+            await db.add_xp(message.from_user.id, bonus_xp)
 
     # Испытание НЕ завершается автоматически: как только все цели закрыты, в сообщении
     # появляется кнопка "Завершить испытание". Пока её не нажали, можно продолжать
@@ -130,8 +139,11 @@ async def on_finish_challenge(call: CallbackQuery):
         await call.answer("Ещё не все цели дня выполнены.", show_alert=True)
         return
 
+    user = await db.get_user(call.from_user.id)
+    reward = xp_reward_for_challenge(user["level"])
+
     await db.set_active_focus(challenge_id, None)
-    await db.add_xp(call.from_user.id, XP_PER_CHALLENGE)
+    await db.add_xp(call.from_user.id, reward)
     await db.increment_streak(call.from_user.id)
     await db.complete_challenge(challenge_id, with_photo=bool(challenge["physical_photo_posted"]))
 

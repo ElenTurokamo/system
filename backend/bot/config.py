@@ -38,52 +38,130 @@ class Settings:
 
 settings = Settings()
 
-# XP, необходимый для получения одного уровня
-XP_PER_CHALLENGE = 100
-XP_PER_LEVEL = 1000
+# ---------- Прогрессия опыта ----------
+#
+# Раньше стоимость уровня и награда за испытание были фиксированными (1000 XP на
+# уровень, 100 XP за испытание всегда). Теперь и то, и другое растёт вместе с
+# уровнем игрока: на старте прокачка быстрая и легко ощутимая, на высоких уровнях
+# требует больше, но и награда за прохождение испытания выше.
+
+# Стоимость перехода с уровня 1 на уровень 2.
+XP_PER_LEVEL_BASE = 1000
+# На сколько процентов дорожает КАЖДЫЙ следующий уровень относительно предыдущего.
+XP_LEVEL_GROWTH = 0.12
+
+# Базовая награда XP за одно завершённое испытание (на 1 уровне).
+XP_PER_CHALLENGE_BASE = 100
+# На сколько процентов растёт награда за испытание с каждым уровнем игрока.
+XP_REWARD_GROWTH = 0.08
 
 # Секретный бонус: если ВСЕ выбранные дисциплины довести до target * BONUS_MULTIPLIER,
-# начисляется BONUS_LEVELS уровней разом (один раз за испытание).
+# начисляется XP, эквивалентный BONUS_LEVELS уровням от текущего уровня игрока
+# (один раз за испытание).
 BONUS_MULTIPLIER = 2
 BONUS_LEVELS = 5
 
+
+def xp_required_for_level(level: int) -> int:
+    """Сколько XP нужно набрать, чтобы перейти С этого уровня на следующий."""
+    raw = XP_PER_LEVEL_BASE * (1 + XP_LEVEL_GROWTH) ** (level - 1)
+    return max(10, int(round(raw / 10) * 10))  # округляем до десятков
+
+
+def level_from_total_xp(total_xp: int) -> tuple[int, int, int]:
+    """
+    Переводит суммарный (пожизненный) XP игрока в (уровень, XP внутри уровня,
+    XP нужно для следующего уровня). Уровень 1 стартует с 0 XP.
+    """
+    level = 1
+    remaining = max(0, total_xp)
+    while True:
+        needed = xp_required_for_level(level)
+        if remaining < needed:
+            return level, remaining, needed
+        remaining -= needed
+        level += 1
+
+
+def xp_for_n_levels(start_level: int, n: int) -> int:
+    """Сколько всего XP нужно, чтобы подняться на n уровней начиная со start_level."""
+    return sum(xp_required_for_level(start_level + i) for i in range(n))
+
+
+def xp_reward_for_challenge(level: int) -> int:
+    """Награда XP за завершённое дневное испытание - растёт вместе с уровнем игрока."""
+    raw = XP_PER_CHALLENGE_BASE * (1 + XP_REWARD_GROWTH) ** (level - 1)
+    return max(10, int(round(raw / 5) * 5))
+
+
+# ---------- Прогрессия сложности испытаний ----------
+#
+# Дневная цель по каждой дисциплине растёт вместе с уровнем игрока: от разумного
+# для новичка минимума (target_min) до потолка (target_max), который достигается
+# к TARGET_GROWTH_CAP_LEVEL и дальше не растёт. target_step — во что округляется
+# цель, чтобы цифры выглядели аккуратно (кратно 5, а не "63 отжимания").
+
+TARGET_GROWTH_CAP_LEVEL = 50  # с этого уровня цель уже максимальная
+
+
+def target_for_level(focus_key: str, level: int) -> int:
+    opt = FOCUS_OPTIONS[focus_key]
+    lo, hi, step = opt["target_min"], opt["target_max"], opt["target_step"]
+
+    progress = min(max(level - 1, 0), TARGET_GROWTH_CAP_LEVEL - 1) / (TARGET_GROWTH_CAP_LEVEL - 1)
+    raw = lo + (hi - lo) * progress
+    value = int(round(raw / step) * step)
+    return max(lo, min(hi, value))
+
+
 # Доступные "фокусы" испытаний. Можно расширять сколько угодно.
-# target — дневная цель по этому фокусу
+# target_min — цель на 1 уровне (разумный старт для новичка)
+# target_max — цель на TARGET_GROWTH_CAP_LEVEL и выше (потолок сложности)
 FOCUS_OPTIONS = {
     "pushups": {
-        "label": "🥊 Отжимания",
+        "label": "💪 Отжимания",
         "unit": "раз",
         "counter_field": "daily_pushups",
         "kind": "physical",
-        "target": 50,
+        "target_min": 10,
+        "target_max": 100,
+        "target_step": 5,
     },
     "squats": {
-        "label": "🦵 Приседания",
+        "label": "🍑 Приседания",
         "unit": "раз",
         "counter_field": "daily_squats",
         "kind": "physical",
-        "target": 50,
+        "target_min": 15,
+        "target_max": 100,
+        "target_step": 5,
     },
     "abs": {
-        "label": "🔥 Пресс",
+        "label": "🍫 Пресс",
         "unit": "раз",
         "counter_field": "daily_abs",
         "kind": "physical",
-        "target": 50,
+        "target_min": 15,
+        "target_max": 100,
+        "target_step": 5,
     },
     "chess": {
         "label": "♟ Шахматы",
         "unit": "партий",
         "counter_field": "daily_chess",
         "kind": "mental",
-        "target": 5,
+        "target_min": 1,
+        "target_max": 6,
+        "target_step": 1,
     },
     "reading": {
         "label": "📖 Чтение",
         "unit": "страниц",
         "counter_field": "daily_reading",
         "kind": "mental",
-        "target": 20,
+        "target_min": 10,
+        "target_max": 60,
+        "target_step": 5,
     },
 }
 

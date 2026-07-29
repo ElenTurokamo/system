@@ -190,9 +190,9 @@ class Database:
     async def add_xp(self, user_id: int, amount: int):
         user = await self.get_user(user_id)
         new_xp = user["xp"] + amount
-        from bot.config import XP_PER_LEVEL
+        from bot.config import level_from_total_xp
 
-        new_level = new_xp // XP_PER_LEVEL + 1
+        new_level, _, _ = level_from_total_xp(new_xp)
         leveled_up = new_level > user["level"]
         await self._conn.execute(
             "UPDATE users SET xp = ?, level = ? WHERE user_id = ?", (new_xp, new_level, user_id)
@@ -230,7 +230,18 @@ class Database:
     # ---------- challenges ----------
 
     async def create_challenge(self, user_id: int, quest_text: str, focuses: list[str]) -> int:
-        """Создаёт испытание дня и по одной строке прогресса на каждый выбранный фокус."""
+        """Создаёт испытание дня и по одной строке прогресса на каждый выбранный фокус.
+
+        Цель по каждому фокусу зависит от текущего уровня игрока - чем выше уровень,
+        тем ближе цель к потолку сложности (см. target_for_level в config.py)."""
+        from bot.config import level_from_total_xp, target_for_level
+
+        user = await self.get_user(user_id)
+        # Уровень пересчитывается из XP напрямую (а не берётся из закэшированного
+        # поля level), чтобы сложность сразу была верной даже для игроков, у которых
+        # level в БД ещё не пересчитан по новой формуле (обновится при первом add_xp).
+        level, _, _ = level_from_total_xp(user["xp"]) if user else (1, 0, 0)
+
         now = datetime.utcnow().isoformat()
         cur = await self._conn.execute(
             """INSERT INTO challenges (user_id, status, quest_text, started_at)
@@ -240,7 +251,7 @@ class Database:
         challenge_id = cur.lastrowid
 
         for focus_key in focuses:
-            target = FOCUS_OPTIONS[focus_key]["target"]
+            target = target_for_level(focus_key, level)
             await self._conn.execute(
                 "INSERT INTO challenge_progress (challenge_id, focus, target) VALUES (?, ?, ?)",
                 (challenge_id, focus_key, target),

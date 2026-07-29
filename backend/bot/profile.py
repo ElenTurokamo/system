@@ -11,7 +11,7 @@ from datetime import datetime
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.config import time_of_day_label, XP_PER_LEVEL
+from bot.config import level_from_total_xp, time_of_day_label
 from bot.database import db
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ def render_profile_text(user: dict) -> str:
         if until > datetime.utcnow():
             penalty_line = f"\n🚫 Штраф активен до {until.strftime('%Y-%m-%d %H:%M UTC')}"
 
-    xp_into_level = user["xp"] % XP_PER_LEVEL
+    level, xp_into_level, xp_needed = level_from_total_xp(user["xp"])
     time_label = time_of_day_label(user["time_of_day"]) if user["time_of_day"] else "—"
     group_line = "да ✅" if user["group_id"] else "нет (напиши /bind_group в группе)"
     streak = user["streak"]
@@ -60,7 +60,7 @@ def render_profile_text(user: dict) -> str:
     header = (
         "『Профиль Игрока』\n\n"
         f"🆔 {display_name(user)} · #{player_code(user)}\n"
-        f"🏆 Уровень: {user['level']} ({xp_into_level}/{XP_PER_LEVEL} XP)\n"
+        f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
         f"🔥 Серия: {streak} {ru_days(streak)}\n\n"
         f"⏰ Время испытаний: {time_label}\n"
         f"👥 Группа привязана: {group_line}"
