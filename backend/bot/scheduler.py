@@ -5,7 +5,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from bot import challenge_render
-from bot import keyboards as kb
 from bot import messages as tx
 from bot import profile
 from bot.config import settings
@@ -33,15 +32,9 @@ async def dispatch_daily_challenges(bot: Bot, time_of_day: str):
             timeout=settings.challenge_timeout_hours,
         )
         challenge_id = await db.create_challenge(user["user_id"], quest_text, focuses)
-        progress_rows = await db.get_progress_rows(challenge_id)
 
         try:
-            msg = await bot.send_message(
-                user["user_id"],
-                quest_text,
-                reply_markup=kb.challenge_kb(challenge_id, progress_rows, active_focus=None),
-            )
-            await db.set_message_id(challenge_id, msg.message_id)
+            await challenge_render.send_challenge_message(bot, challenge_id)
         except Exception as e:
             logger.warning("Не удалось отправить испытание пользователю %s: %s", user["user_id"], e)
 

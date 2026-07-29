@@ -4,13 +4,15 @@
 Сообщение испытания живёт с момента отправки до полного завершения дня
 (все цели выполнены и нажато "Завершить испытание", либо "Сдался", либо
 истекло время) и всегда РЕДАКТИРУЕТСЯ, а не пересоздаётся. Новое сообщение
-отправляется только при диспетчеризации следующего дня.
+отправляется только при диспетчеризации следующего дня (или при пересылке,
+если старое стало пользователю недоступно).
 
 Фото для физических дисциплин запрашивается СРАЗУ, как только все физические
 цели закрыты (не дожидаясь интеллектуальных) - см. _physical_photo_pending.
 Для чисто интеллектуальных испытаний фото не запрашивается вовсе.
 """
 import logging
+from datetime import datetime, timedelta
 
 from aiogram import Bot
 
@@ -20,9 +22,41 @@ from bot.database import db
 
 logger = logging.getLogger(__name__)
 
+DIVIDER = "=" * 27
+TAGLINE = "Тренируйся, чтобы стать сильнее и повысить свой уровень."
+
 
 def _join(lines: list[str]) -> str:
     return ("\n\n" + "\n\n".join(lines)) if lines else ""
+
+
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    n_abs = abs(n)
+    if n_abs % 10 == 1 and n_abs % 100 != 11:
+        return one
+    if n_abs % 10 in (2, 3, 4) and n_abs % 100 not in (12, 13, 14):
+        return few
+    return many
+
+
+def _format_time_left(challenge: dict) -> str:
+    """Строка обратного отсчёта до провала испытания по таймауту."""
+    try:
+        started = datetime.fromisoformat(challenge["started_at"])
+    except (TypeError, ValueError):
+        return "⏱️ До провала испытания осталось: —"
+
+    deadline = started + timedelta(hours=settings.challenge_timeout_hours)
+    remaining = deadline - datetime.utcnow()
+
+    if remaining.total_seconds() <= 0:
+        return "⏱️ Время испытания на исходе - вот-вот сгорит."
+
+    total_minutes = int(remaining.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    hours_label = _ru_plural(hours, "час", "часа", "часов")
+    minutes_label = _ru_plural(minutes, "минута", "минуты", "минут")
+    return f"⏱️ До провала испытания осталось: {hours} {hours_label} и {minutes} {minutes_label}."
 
 
 def _physical_photo_pending(challenge: dict, progress_rows: list[dict]) -> bool:
@@ -33,26 +67,39 @@ def _physical_photo_pending(challenge: dict, progress_rows: list[dict]) -> bool:
     return bool(physical_rows) and all(r["completed"] for r in physical_rows)
 
 
-async def _build_footer(challenge: dict, progress_rows: list[dict]) -> str:
+async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
     status = challenge["status"]
-    lines: list[str] = []
-
-    if challenge.get("bonus_claimed"):
-        lines.append(
-            f"🎁 Секретный бонус получен: +{BONUS_LEVELS} уровней "
-            f"(все дисциплины доведены до x{BONUS_MULTIPLIER})."
-        )
+    quest = challenge["quest_text"] or ""
 
     if status == "awaiting_action":
+        parts = [quest, TAGLINE]
+
+        extra: list[str] = []
+        if challenge.get("bonus_claimed"):
+            extra.append(
+                f"🎁 Секретный бонус получен: +{BONUS_LEVELS} уровней "
+                f"(все дисциплины доведены до x{BONUS_MULTIPLIER})."
+            )
         if _physical_photo_pending(challenge, progress_rows):
-            lines.append(
+            extra.append(
                 "💪 Физическая часть выполнена! Пришли фото, чтобы зафиксировать "
                 "результат в группе, или нажми «Пропустить фото»."
             )
         if challenge["active_focus"]:
             opt = FOCUS_OPTIONS[challenge["active_focus"]]
-            lines.append(f"➜ {opt['label']}: жду цифру")
-        return _join(lines)
+            extra.append(f"➜ {opt['label']}: жду цифру")
+        if extra:
+            parts.append("\n\n".join(extra))
+
+        parts.append(f"{DIVIDER}\n{_format_time_left(challenge)}")
+        return "\n\n".join(parts)
+
+    lines: list[str] = []
+    if challenge.get("bonus_claimed"):
+        lines.append(
+            f"🎁 Секретный бонус получен: +{BONUS_LEVELS} уровней "
+            f"(все дисциплины доведены до x{BONUS_MULTIPLIER})."
+        )
 
     if status in ("completed", "completed_with_photo"):
         lines.append("✅ Испытание завершено.")
@@ -61,20 +108,20 @@ async def _build_footer(challenge: dict, progress_rows: list[dict]) -> str:
             lines.append(f"🔥 Стрик: {user['streak']} · 🏆 Уровень {user['level']} ({user['xp']} XP)")
         if status == "completed_with_photo":
             lines.append("📸 Фото сохранено.")
-        return _join(lines)
+        return quest + _join(lines)
 
     if status == "gave_up":
         lines.append(
             f"🏳 Испытание прервано. Штраф на {settings.penalty_hours}ч: "
             "без игр, контента 18+ и спонтанных действий."
         )
-        return _join(lines)
+        return quest + _join(lines)
 
     if status == "expired":
         lines.append("⌛ Время испытания истекло. Стрик сброшен.")
-        return _join(lines)
+        return quest + _join(lines)
 
-    return _join(lines)
+    return quest + _join(lines)
 
 
 def _build_keyboard(challenge: dict, progress_rows: list[dict]):
@@ -96,8 +143,7 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
         return
 
     progress_rows = await db.get_progress_rows(challenge_id)
-    footer = await _build_footer(challenge, progress_rows)
-    text = (challenge["quest_text"] or "") + footer
+    text = await _build_text(challenge, progress_rows)
     markup = _build_keyboard(challenge, progress_rows)
 
     try:
@@ -111,23 +157,28 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
         logger.info("Не удалось обновить сообщение испытания %s: %s", challenge_id, e)
 
 
-async def resend_challenge_message(bot: Bot, challenge_id: int):
+async def send_challenge_message(bot: Bot, challenge_id: int):
     """
-    Отправляет актуальное состояние испытания НОВЫМ сообщением и переносит на него
-    "точку правды" (message_id в БД), по которой дальше будет работать push_challenge_update.
+    Отправляет актуальное состояние испытания НОВЫМ сообщением и записывает его
+    message_id как точку правды, по которой дальше работает push_challenge_update.
 
-    Нужно для случаев, когда старое сообщение недоступно пользователю (например, он
-    очистил историю чата) - иначе push_challenge_update продолжал бы молча редактировать
-    сообщение, которое пользователь уже не видит.
+    Используется как при первичной отправке испытания дня (диспетчер), так и при
+    пересылке, если старое сообщение недоступно пользователю (например, он
+    очистил историю чата) - иначе push_challenge_update продолжал бы молча
+    редактировать сообщение, которое пользователь уже не видит.
     """
     challenge = await db.get_challenge(challenge_id)
     if not challenge:
         return
 
     progress_rows = await db.get_progress_rows(challenge_id)
-    footer = await _build_footer(challenge, progress_rows)
-    text = (challenge["quest_text"] or "") + footer
+    text = await _build_text(challenge, progress_rows)
     markup = _build_keyboard(challenge, progress_rows)
 
     msg = await bot.send_message(challenge["user_id"], text, reply_markup=markup)
     await db.set_message_id(challenge_id, msg.message_id)
+
+
+# Псевдоним для читаемости на месте вызова (см. handlers/start.py) - смысл действия
+# там именно "переслать снова", хотя механика идентична первичной отправке.
+resend_challenge_message = send_challenge_message

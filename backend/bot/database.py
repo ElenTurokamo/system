@@ -215,7 +215,7 @@ class Database:
     async def add_focus_amount(self, user_id: int, focus_key: str, amount: int):
         field = FOCUS_OPTIONS[focus_key]["counter_field"]
         await self._conn.execute(
-            f"UPDATE users SET {field} = {field} + ? WHERE user_id = ?", (amount, user_id)
+            f"UPDATE users SET {field} = MAX(0, {field} + ?) WHERE user_id = ?", (amount, user_id)
         )
         await self._conn.commit()
 
@@ -358,9 +358,10 @@ class Database:
         return dict(row) if row else None
 
     async def add_progress_amount(self, challenge_id: int, focus_key: str, amount: int) -> dict:
-        """Добавляет подход к прогрессу по фокусу и возвращает обновлённую строку."""
+        """Добавляет подход к прогрессу по фокусу (может быть отрицательным - исправление
+        ошибочно введённого числа) и возвращает обновлённую строку. Не даёт уйти ниже 0."""
         await self._conn.execute(
-            """UPDATE challenge_progress SET amount = amount + ?
+            """UPDATE challenge_progress SET amount = MAX(0, amount + ?)
                WHERE challenge_id = ? AND focus = ?""",
             (amount, challenge_id, focus_key),
         )
@@ -373,6 +374,24 @@ class Database:
             (challenge_id, focus_key),
         )
         await self._conn.commit()
+
+    async def sync_progress_completed(self, challenge_id: int, focus_key: str):
+        """
+        Приводит флаг completed в соответствие текущему amount/target - в обе стороны.
+        Нужно, потому что amount теперь может не только расти, но и уменьшаться
+        (исправление ошибочно введённого числа), а значит дисциплина может как
+        стать выполненной, так и перестать ею быть.
+        """
+        row = await self.get_progress(challenge_id, focus_key)
+        if not row:
+            return
+        should_be_completed = 1 if row["amount"] >= row["target"] else 0
+        if row["completed"] != should_be_completed:
+            await self._conn.execute(
+                "UPDATE challenge_progress SET completed = ? WHERE challenge_id = ? AND focus = ?",
+                (should_be_completed, challenge_id, focus_key),
+            )
+            await self._conn.commit()
 
     async def all_progress_completed(self, challenge_id: int) -> bool:
         cur = await self._conn.execute(

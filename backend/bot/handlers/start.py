@@ -5,6 +5,7 @@ from aiogram.types import CallbackQuery, Message
 from bot import challenge_render
 from bot import keyboards as kb
 from bot import messages as tx
+from bot import profile
 from bot.config import FOCUS_OPTIONS, time_of_day_label
 from bot.database import db
 from bot.registration import finish_registration
@@ -52,17 +53,16 @@ async def cmd_start(message: Message, bot: Bot):
     )
 
     if user["reg_state"] == "done":
-        await message.answer(
-            "Ты уже зарегистрирован, Игрок. Используй /profile, чтобы посмотреть статистику, "
-            "/change_time — сменить время испытаний, /change_focus — сменить дисциплины."
-        )
+        # Никаких информационных сообщений - только сама суть: закреплённый профиль
+        # и (если сегодняшнее испытание ещё не завершено) трекер испытания дня.
+        # Оба пересылаются новым сообщением, а не редактируются на месте, т.к. /start -
+        # явный запрос пользователя и старые сообщения могут быть скрыты у него в чате
+        # (например, после очистки истории).
+        await profile.resend_profile_message(bot, message.from_user.id)
 
-        # Если сегодняшнее испытание уже создано, но старое сообщение с ним недоступно
-        # (например, пользователь очистил чат) - пересылаем его новым сообщением,
-        # иначе испытание "теряется" и push_challenge_update тихо редактирует пустоту.
         active_challenge = await db.get_active_challenge(message.from_user.id)
         if active_challenge:
-            await challenge_render.resend_challenge_message(bot, active_challenge["id"])
+            await challenge_render.send_challenge_message(bot, active_challenge["id"])
         return
 
     text = (

@@ -38,28 +38,35 @@ async def on_focus_picked(call: CallbackQuery):
     await call.answer()
 
 
-@router.message(F.text.regexp(r"^\d+$"))
+@router.message(F.text.regexp(r"^-?\d+$"))
 async def on_amount_logged(message: Message):
     challenge = await db.get_active_challenge(message.from_user.id)
     if not challenge or not challenge["active_focus"]:
-        return  # число не относится ни к одному активному испытанию - не трогаем сообщение
+        # Число не относится ни к одному активному испытанию - это спам, чистим чат.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
 
     amount = int(message.text)
     focus_key = challenge["active_focus"]
 
-    # Число — это один подход. Сообщение с числом сразу удаляется, весь UX живёт
-    # в единственном сообщении испытания.
+    # Число — это один подход (или его отмена, если введено с минусом). Сообщение
+    # с числом сразу удаляется, весь UX живёт в единственном сообщении испытания.
     try:
         await message.delete()
     except Exception:
         pass
 
-    # Пожизненный счётчик пользователя для /profile - не зависит от целей конкретного дня
+    # Пожизненный счётчик пользователя для /profile - не зависит от целей конкретного дня.
+    # Не уходит ниже 0 (см. clamp в database.add_focus_amount).
     await db.add_focus_amount(message.from_user.id, focus_key, amount)
 
-    progress = await db.add_progress_amount(challenge["id"], focus_key, amount)
-    if not progress["completed"] and progress["amount"] >= progress["target"]:
-        await db.mark_progress_completed(challenge["id"], focus_key)
+    # Отрицательное число (например, "-20") вычитает повторения - на случай, если
+    # игрок вписал их не в ту дисциплину. amount тоже не уходит ниже 0.
+    await db.add_progress_amount(challenge["id"], focus_key, amount)
+    await db.sync_progress_completed(challenge["id"], focus_key)
 
     # Секретный бонус: единоразово за ВСЁ испытание, только когда КАЖДАЯ выбранная
     # дисциплина доведена минимум до x2 своей цели - не за одну отдельную дисциплину.
