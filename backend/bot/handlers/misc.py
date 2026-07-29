@@ -1,17 +1,11 @@
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import Message
 
 from bot import profile
 from bot.database import db
 
 router = Router(name="misc")
-
-
-@router.callback_query(F.data == "noop")
-async def noop_callback(call: CallbackQuery):
-    """Кнопки-разделители (заголовки групп дисциплин) ни на что не реагируют."""
-    await call.answer()
 
 
 @router.message(F.pinned_message, F.chat.type == "private")

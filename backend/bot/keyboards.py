@@ -2,32 +2,6 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.config import FOCUS_OPTIONS, TIME_OF_DAY_LABELS, time_of_day_label
 
-KIND_DIVIDER_LABELS = {
-    "physical": "── 💪 Физические ──",
-    "mental": "── 🧠 Интеллектуальные ──",
-}
-
-
-def _grouped_focus_rows(focus_keys: list[str], row_builder) -> list[list[InlineKeyboardButton]]:
-    """
-    Строит кнопки, сгруппированные по типу дисциплины (физическая/интеллектуальная),
-    с разделителем-подписью между группами. Разделитель не нужен, если среди
-    переданных фокусов только один тип.
-    """
-    physical = [k for k in focus_keys if FOCUS_OPTIONS[k]["kind"] == "physical"]
-    mental = [k for k in focus_keys if FOCUS_OPTIONS[k]["kind"] == "mental"]
-    show_dividers = bool(physical) and bool(mental)
-
-    rows: list[list[InlineKeyboardButton]] = []
-    for kind, keys in (("physical", physical), ("mental", mental)):
-        if not keys:
-            continue
-        if show_dividers:
-            rows.append([InlineKeyboardButton(text=KIND_DIVIDER_LABELS[kind], callback_data="noop")])
-        for key in keys:
-            rows.append([row_builder(key)])
-    return rows
-
 
 def time_of_day_kb() -> InlineKeyboardMarkup:
     rows = [
@@ -38,12 +12,12 @@ def time_of_day_kb() -> InlineKeyboardMarkup:
 
 
 def focus_select_kb(selected: list[str]) -> InlineKeyboardMarkup:
-    def build(key: str) -> InlineKeyboardButton:
-        opt = FOCUS_OPTIONS[key]
+    rows = []
+    for key, opt in FOCUS_OPTIONS.items():
         mark = "✅ " if key in selected else "▫️ "
-        return InlineKeyboardButton(text=f"{mark}{opt['label']}", callback_data=f"focus_toggle:{key}")
-
-    rows = _grouped_focus_rows(list(FOCUS_OPTIONS.keys()), build)
+        rows.append(
+            [InlineKeyboardButton(text=f"{mark}{opt['label']}", callback_data=f"focus_toggle:{key}")]
+        )
     rows.append([InlineKeyboardButton(text="Готово ➜", callback_data="focus_done")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -63,9 +37,9 @@ def challenge_kb(
     show_finish: bool = False,
     show_skip_physical_photo: bool = False,
 ) -> InlineKeyboardMarkup:
-    def build(focus_key: str) -> InlineKeyboardButton:
-        p = next(r for r in progress_rows if r["focus"] == focus_key)
-        opt = FOCUS_OPTIONS[focus_key]
+    rows = []
+    for p in progress_rows:
+        opt = FOCUS_OPTIONS[p["focus"]]
 
         markers = []
         if p["completed"]:
@@ -75,10 +49,9 @@ def challenge_kb(
 
         prefix = f"{' '.join(markers)} " if markers else ""
         text = f"{prefix}{opt['label']} {p['amount']}/{p['target']}"
-        return InlineKeyboardButton(text=text, callback_data=f"focus:{challenge_id}:{focus_key}")
-
-    focus_keys = [p["focus"] for p in progress_rows]
-    rows = _grouped_focus_rows(focus_keys, build)
+        rows.append(
+            [InlineKeyboardButton(text=text, callback_data=f"focus:{challenge_id}:{p['focus']}")]
+        )
 
     if show_skip_physical_photo:
         rows.append(

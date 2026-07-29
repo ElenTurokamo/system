@@ -8,6 +8,7 @@ from aiogram.enums import ParseMode
 from bot.config import settings
 from bot.database import db
 from bot.handlers import challenge, group, misc, start
+from bot.middlewares import DeleteCommandsMiddleware
 from bot.scheduler import setup_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -20,6 +21,7 @@ async def main():
 
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    dp.message.middleware(DeleteCommandsMiddleware())
 
     dp.include_router(start.router)
     dp.include_router(group.router)

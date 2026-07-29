@@ -61,7 +61,7 @@ def render_profile_text(user: dict) -> str:
         "『Профиль Игрока』\n\n"
         f"🆔 {display_name(user)} · #{player_code(user)}\n"
         f"🏆 Уровень: {user['level']} ({xp_into_level}/{XP_PER_LEVEL} XP)\n"
-        f"🔥 Серия: {streak} {ru_days(streak)}\n"
+        f"🔥 Серия: {streak} {ru_days(streak)}\n\n"
         f"⏰ Время испытаний: {time_label}\n"
         f"👥 Группа привязана: {group_line}"
     )
