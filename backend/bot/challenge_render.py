@@ -23,7 +23,6 @@ from bot.database import db
 logger = logging.getLogger(__name__)
 
 DIVIDER = "=" * 27
-TAGLINE = "Тренируйся, чтобы стать сильнее и повысить свой уровень."
 
 
 def _join(lines: list[str]) -> str:
@@ -72,27 +71,17 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
     quest = challenge["quest_text"] or ""
 
     if status == "awaiting_action":
-        parts = [quest, TAGLINE]
-
-        extra: list[str] = []
-        if challenge.get("bonus_claimed"):
-            extra.append(
-                f"🎁 Секретный бонус получен: +{BONUS_LEVELS} уровней "
-                f"(все дисциплины доведены до x{BONUS_MULTIPLIER})."
-            )
+        # Карточка активного испытания всегда выглядит ровно так: заголовок+строка
+        # квеста, разделитель, таймер. Статус бонуса и выбранная дисциплина видны
+        # прямо на кнопках клавиатуры (🎯, «Пропустить фото», «Завершить испытание»),
+        # текстом не дублируются. Исключение - подсказка про фото физических
+        # активностей: она добавляется отдельной строкой сразу под таймером, пока
+        # все физические цели закрыты, а фото ещё не отправлено/пропущено, и
+        # автоматически пропадает при следующей перерисовке после отправки фото.
+        text = f"{quest}\n\n{DIVIDER}\n{_format_time_left(challenge)}"
         if _physical_photo_pending(challenge, progress_rows):
-            extra.append(
-                "💪 Физическая часть выполнена! Пришли фото, чтобы зафиксировать "
-                "результат в группе, или нажми «Пропустить фото»."
-            )
-        if challenge["active_focus"]:
-            opt = FOCUS_OPTIONS[challenge["active_focus"]]
-            extra.append(f"➜ {opt['label']}: жду цифру")
-        if extra:
-            parts.append("\n\n".join(extra))
-
-        parts.append(f"{DIVIDER}\n{_format_time_left(challenge)}")
-        return "\n\n".join(parts)
+            text += "\n📸 Пришли фото выполнения всех физических активностей."
+        return text
 
     lines: list[str] = []
     if challenge.get("bonus_claimed"):
