@@ -45,7 +45,7 @@ def display_name(user: dict) -> str:
     return user.get("first_name") or user.get("username") or f"Игрок {user['user_id']}"
 
 
-def render_profile_text(user: dict) -> str:
+def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claimed_today: bool = False) -> str:
     penalty_line = ""
     if user.get("penalty_until"):
         until = datetime.fromisoformat(user["penalty_until"])
@@ -74,7 +74,16 @@ def render_profile_text(user: dict) -> str:
         f"📖 Чтение (страниц): {user['daily_reading']}"
     )
 
-    return f"{header}\n\n{stats}{penalty_line}"
+    text = f"{header}\n\n{stats}{penalty_line}"
+    if quest_done_today:
+        # Обе строки появляются только пока последнее испытание пользователя
+        # закрыто как выполненное; как только диспетчер создаст новое испытание
+        # на следующий день (его статус снова станет awaiting_action), они
+        # перестают выводиться сами собой - см. sync/resend_profile_message.
+        text += "\n\n✅ Вы выполнили сегодняшний квест."
+        if bonus_claimed_today:
+            text += "\n✅ Вы завершили секретное испытание."
+    return text
 
 
 async def sync_profile_message(bot: Bot, user_id: int):
@@ -89,7 +98,12 @@ async def sync_profile_message(bot: Bot, user_id: int):
     if not user:
         return
 
-    text = render_profile_text(user)
+    latest_challenge = await db.get_latest_challenge(user_id)
+    quest_done_today = bool(
+        latest_challenge and latest_challenge["status"] in ("completed", "completed_with_photo")
+    )
+    bonus_claimed_today = bool(quest_done_today and latest_challenge.get("bonus_claimed"))
+    text = render_profile_text(user, quest_done_today, bonus_claimed_today)
 
     if user.get("profile_message_id"):
         try:
@@ -128,7 +142,12 @@ async def resend_profile_message(bot: Bot, user_id: int):
     if not user:
         return
 
-    text = render_profile_text(user)
+    latest_challenge = await db.get_latest_challenge(user_id)
+    quest_done_today = bool(
+        latest_challenge and latest_challenge["status"] in ("completed", "completed_with_photo")
+    )
+    bonus_claimed_today = bool(quest_done_today and latest_challenge.get("bonus_claimed"))
+    text = render_profile_text(user, quest_done_today, bonus_claimed_today)
 
     if user.get("profile_message_id"):
         try:

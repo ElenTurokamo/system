@@ -270,6 +270,22 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
+    async def get_latest_challenge(self, user_id: int) -> Optional[dict]:
+        """
+        Последнее (по времени создания) испытание пользователя, вне зависимости
+        от статуса. Используется профилем, чтобы понять, выполнен ли квест на
+        сегодня - строка "Вы выполнили сегодняшний квест" в профиле держится,
+        пока status последнего испытания completed/completed_with_photo, и
+        пропадает сама, как только диспетчер создаёт новое испытание на завтра
+        (тогда последним снова становится свежее awaiting_action).
+        """
+        cur = await self._conn.execute(
+            "SELECT * FROM challenges WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
     async def get_challenge(self, challenge_id: int) -> Optional[dict]:
         cur = await self._conn.execute("SELECT * FROM challenges WHERE id = ?", (challenge_id,))
         row = await cur.fetchone()

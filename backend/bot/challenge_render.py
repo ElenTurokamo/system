@@ -137,6 +137,21 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
     if not challenge or not challenge.get("message_id"):
         return
 
+    status = challenge["status"]
+
+    if status in ("completed", "completed_with_photo"):
+        # Успешное завершение дня больше не оформляется отдельной "отчётной"
+        # карточкой (✅ Испытание завершено / стрик / уровень / фото / бонус) -
+        # вся эта информация (включая секретный бонус, если он был получен)
+        # теперь постоянно видна в профиле двумя строками в его конце (см.
+        # profile.py). Чтобы не дублировать её в чате, карточка испытания
+        # просто удаляется.
+        try:
+            await bot.delete_message(challenge["user_id"], challenge["message_id"])
+        except Exception as e:
+            logger.info("Не удалось удалить сообщение испытания %s: %s", challenge_id, e)
+        return
+
     progress_rows = await db.get_progress_rows(challenge_id)
     text = await _build_text(challenge, progress_rows)
     markup = _build_keyboard(challenge, progress_rows)
