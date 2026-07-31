@@ -109,12 +109,12 @@ def photo_caption(streak: int, user_id: int) -> str:
     return template.format(streak=streak, user_id=user_id)
 
 
-def give_up(penalty_hours: int) -> str:
-    return _compose("give_up", penalty_hours=penalty_hours)
+def give_up(xp_loss: int = 0, penalty_hours: int = 0) -> str:
+    return _compose("give_up", xp_loss=xp_loss, penalty_hours=penalty_hours)
 
 
-def expired() -> str:
-    return _compose("expired")
+def expired(xp_loss: int = 0, penalty_hours: int = 0) -> str:
+    return _compose("expired", xp_loss=xp_loss, penalty_hours=penalty_hours)
 
 
 def level_up(level: int) -> str:

@@ -11,7 +11,7 @@ from datetime import datetime
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
-from bot.config import FOCUS_OPTIONS, level_from_total_xp, time_of_day_label
+from bot.config import FOCUS_OPTIONS, level_from_total_xp, settings, time_of_day_label
 from bot.database import db
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,46 @@ def ru_days(n: int) -> str:
     if n_abs % 10 in (2, 3, 4) and n_abs % 100 not in (12, 13, 14):
         return "дня"
     return "дней"
+
+
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    n_abs = abs(n)
+    if n_abs % 10 == 1 and n_abs % 100 != 11:
+        return one
+    if n_abs % 10 in (2, 3, 4) and n_abs % 100 not in (12, 13, 14):
+        return few
+    return many
+
+
+def penalty_block(user: dict) -> str:
+    """
+    Блок-уведомление о провале требования Системы: показывается, пока у игрока
+    активно ограничение (penalty_until в будущем). Всегда встаёт в самый низ
+    профиля - см. render_profile_text - чтобы цепляться взглядом в первую
+    очередь. Обратный отсчёт пересчитывается при каждом вызове, а сам профиль
+    перерисовывается раз в минуту планировщиком (см. scheduler.refresh_penalty_profiles).
+    """
+    penalty_until = user.get("penalty_until")
+    if not penalty_until:
+        return ""
+
+    until = datetime.fromisoformat(penalty_until)
+    remaining = until - datetime.utcnow()
+    if remaining.total_seconds() <= 0:
+        return ""
+
+    total_minutes = int(remaining.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    hours_label = _ru_plural(hours, "час", "часа", "часов")
+    minutes_label = _ru_plural(minutes, "минута", "минуты", "минут")
+
+    return (
+        "🚫 Вы не выполнили требование системы. На вас были наложены ограничения. \n"
+        f"В течении следующих {settings.penalty_hours} часов вы не можете:\n\n"
+        "* Смотреть контент 18+\n"
+        "* Играть в любые видеоигры.\n\n"
+        f"⏱️ До снятия ограничений осталось {hours} {hours_label} и {minutes} {minutes_label}."
+    )
 
 
 def player_code(user: dict) -> str:
@@ -46,12 +86,6 @@ def display_name(user: dict) -> str:
 
 
 def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claimed_today: bool = False) -> str:
-    penalty_line = ""
-    if user.get("penalty_until"):
-        until = datetime.fromisoformat(user["penalty_until"])
-        if until > datetime.utcnow():
-            penalty_line = f"\n🚫 Штраф активен до {until.strftime('%Y-%m-%d %H:%M UTC')}"
-
     level, xp_into_level, xp_needed = level_from_total_xp(user["xp"])
     time_label = time_of_day_label(user["time_of_day"]) if user["time_of_day"] else "—"
     group_line = "да ✅" if user["group_id"] else "нет (напиши /bind_group в группе)"
@@ -74,16 +108,44 @@ def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claime
         f"{FOCUS_OPTIONS['reading']['label']} (страниц): {user['daily_reading']}"
     )
 
-    text = f"{header}\n\n{stats}{penalty_line}"
+    text = f"{header}\n\n{stats}"
+
+    # "Хвост" профиля: отметка о выполнении сегодняшнего квеста (пропадает сама,
+    # как только диспетчер создаст новое испытание на следующий день - см.
+    # sync/resend_profile_message) и блок штрафа за провал требования Системы.
+    # Блок штрафа всегда идёт САМЫМ ПОСЛЕДНИМ, чтобы взгляд цеплялся за него
+    # в первую очередь, даже если квест на сегодня уже выполнен.
+    tail: list[str] = []
     if quest_done_today:
-        # Обе строки появляются только пока последнее испытание пользователя
-        # закрыто как выполненное; как только диспетчер создаст новое испытание
-        # на следующий день (его статус снова станет awaiting_action), они
-        # перестают выводиться сами собой - см. sync/resend_profile_message.
-        text += "\n\n✅ Вы выполнили сегодняшний квест."
+        tail.append("✅ Вы выполнили сегодняшний квест.")
         if bonus_claimed_today:
-            text += "\n✅ Вы завершили секретное испытание."
+            tail.append("✅ Вы завершили секретное испытание.")
+
+    penalty_text = penalty_block(user)
+    if penalty_text:
+        tail.append(penalty_text)
+
+    if tail:
+        text += "\n\n" + "\n".join(tail)
     return text
+
+
+async def clear_failure_message(bot: Bot, user: dict):
+    """
+    Удаляет предыдущее сообщение-отчёт о провале испытания (если оно есть) -
+    вызывается диспетчером при выдаче нового ежедневного квеста (см.
+    scheduler.dispatch_daily_challenges), чтобы отчёты о провалах не копились
+    в чате. Подпись о штрафе в самом профиле (penalty_block) при этом НЕ
+    трогается - она держится по penalty_until независимо от смены испытаний.
+    """
+    if not user.get("failure_message_id"):
+        return
+    chat_id = user.get("failure_chat_id") or user["user_id"]
+    try:
+        await bot.delete_message(chat_id, user["failure_message_id"])
+    except Exception as e:
+        logger.info("Не удалось удалить отчёт о провале %s: %s", user["user_id"], e)
+    await db.clear_failure_message(user["user_id"])
 
 
 async def sync_profile_message(bot: Bot, user_id: int):

@@ -172,8 +172,15 @@ async def on_give_up(call: CallbackQuery):
 
     await db.give_up_challenge(challenge_id)
     await db.reset_streak(call.from_user.id)
+    # "Сдался" - это тоже пропущенный день: та же XP-плата и то же ограничение,
+    # что и при обычной просрочке (см. scheduler.expire_stale_challenges).
+    await db.add_xp(call.from_user.id, -settings.missed_day_xp_penalty)
     await db.set_penalty(call.from_user.id, settings.penalty_hours)
 
-    await challenge_render.push_challenge_update(call.bot, challenge_id)
+    await challenge_render.close_failed_challenge(
+        call.bot,
+        challenge_id,
+        tx.give_up(xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours),
+    )
     await profile.sync_profile_message(call.bot, call.from_user.id)
     await call.answer()

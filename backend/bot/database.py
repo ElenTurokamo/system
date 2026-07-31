@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS users (
     reg_state       TEXT DEFAULT 'done', -- FSM-состояние регистрации
     last_reg_message_id INTEGER,         -- id последнего служебного/шагового сообщения (для удаления)
     profile_chat_id     INTEGER,         -- чат, где закреплена сводка профиля
-    profile_message_id  INTEGER          -- id закреплённого сообщения-сводки
+    profile_message_id  INTEGER,         -- id закреплённого сообщения-сводки
+    failure_chat_id      INTEGER,        -- чат последнего сообщения-отчёта о провале испытания
+    failure_message_id   INTEGER         -- id последнего сообщения-отчёта о провале (удаляется при новом квесте)
 );
 
 CREATE TABLE IF NOT EXISTS challenges (
@@ -84,6 +86,8 @@ class Database:
             "last_reg_message_id": "INTEGER",
             "profile_chat_id": "INTEGER",
             "profile_message_id": "INTEGER",
+            "failure_chat_id": "INTEGER",
+            "failure_message_id": "INTEGER",
         }
         changed = False
         for name, col_type in new_user_columns.items():
@@ -180,6 +184,20 @@ class Database:
         )
         await self._conn.commit()
 
+    async def set_failure_message(self, user_id: int, chat_id: int, message_id: int):
+        await self._conn.execute(
+            "UPDATE users SET failure_chat_id = ?, failure_message_id = ? WHERE user_id = ?",
+            (chat_id, message_id, user_id),
+        )
+        await self._conn.commit()
+
+    async def clear_failure_message(self, user_id: int):
+        await self._conn.execute(
+            "UPDATE users SET failure_chat_id = NULL, failure_message_id = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        await self._conn.commit()
+
     async def get_users_by_time(self, time_of_day: str) -> list[dict]:
         cur = await self._conn.execute(
             "SELECT * FROM users WHERE time_of_day = ? AND reg_state = 'done'", (time_of_day,)
@@ -188,17 +206,24 @@ class Database:
         return [dict(r) for r in rows]
 
     async def add_xp(self, user_id: int, amount: int):
+        """
+        Изменяет суммарный XP игрока (amount может быть отрицательным - например,
+        штраф за пропущенный день) и пересчитывает уровень. XP не уходит ниже 0 -
+        иначе штрафы могли бы образовать "долг", который потом пришлось бы
+        отрабатывать несколько дней подряд просто чтобы вернуться к нулю.
+        """
         user = await self.get_user(user_id)
-        new_xp = user["xp"] + amount
+        new_xp = max(0, user["xp"] + amount)
         from bot.config import level_from_total_xp
 
         new_level, _, _ = level_from_total_xp(new_xp)
         leveled_up = new_level > user["level"]
+        leveled_down = new_level < user["level"]
         await self._conn.execute(
             "UPDATE users SET xp = ?, level = ? WHERE user_id = ?", (new_xp, new_level, user_id)
         )
         await self._conn.commit()
-        return new_xp, new_level, leveled_up
+        return new_xp, new_level, leveled_up, leveled_down
 
     async def increment_streak(self, user_id: int):
         await self._conn.execute(
@@ -218,6 +243,22 @@ class Database:
             f"UPDATE users SET {field} = MAX(0, {field} + ?) WHERE user_id = ?", (amount, user_id)
         )
         await self._conn.commit()
+
+    async def get_users_with_active_penalty(self, grace_minutes: int = 2) -> list[dict]:
+        """
+        Пользователи, у которых сейчас действует ограничение, плюс небольшой
+        запас в прошлое (grace_minutes) - чтобы поймать момент, когда штраф
+        только что истёк, и один последний раз перерисовать профиль без
+        блока ограничения (иначе он "залипнет" в тексте до следующего
+        произвольного действия пользователя).
+        """
+        cutoff = (datetime.utcnow() - timedelta(minutes=grace_minutes)).isoformat()
+        cur = await self._conn.execute(
+            "SELECT * FROM users WHERE penalty_until IS NOT NULL AND penalty_until > ?",
+            (cutoff,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def set_penalty(self, user_id: int, hours: int):
         until = (datetime.utcnow() + timedelta(hours=hours)).isoformat()

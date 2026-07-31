@@ -25,6 +25,10 @@ class Settings:
         default_factory=lambda: int(_env("CHALLENGE_TIMEOUT_HOURS", "18"))
     )
     penalty_hours: int = field(default_factory=lambda: int(_env("PENALTY_HOURS", "48")))
+    # Сколько XP снимается с игрока за каждый пропущенный (просроченный) день.
+    missed_day_xp_penalty: int = field(
+        default_factory=lambda: int(_env("MISSED_DAY_XP_PENALTY", "300"))
+    )
 
     @property
     def time_slots(self) -> dict:

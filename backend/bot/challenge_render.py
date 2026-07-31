@@ -167,6 +167,38 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
         logger.info("Не удалось обновить сообщение испытания %s: %s", challenge_id, e)
 
 
+async def close_failed_challenge(bot: Bot, challenge_id: int, failure_text: str):
+    """
+    Единая точка закрытия ПРОВАЛЕННОГО испытания - неважно, истёк таймаут или
+    игрок сдался сам. Вместо того чтобы редактировать карточку испытания в
+    "отчёт о провале" и оставлять её висеть в чате навсегда, теперь:
+      1) карточка испытания удаляется;
+      2) отдельным сообщением приходит отчёт о провале, id которого
+         сохраняется в users.failure_message_id - чтобы диспетчер мог
+         автоматически удалить именно его, как только выдаст следующее
+         ежедневное испытание (см. scheduler.dispatch_daily_challenges /
+         profile.clear_failure_message). Подпись о штрафе в самом профиле
+         (см. profile.penalty_block) при этом не трогается - она живёт по
+         penalty_until независимо от смены испытаний.
+    """
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge:
+        return
+    user_id = challenge["user_id"]
+
+    if challenge.get("message_id"):
+        try:
+            await bot.delete_message(user_id, challenge["message_id"])
+        except Exception as e:
+            logger.info("Не удалось удалить карточку проваленного испытания %s: %s", challenge_id, e)
+
+    try:
+        msg = await bot.send_message(user_id, failure_text)
+        await db.set_failure_message(user_id, user_id, msg.message_id)
+    except Exception as e:
+        logger.warning("Не удалось отправить отчёт о провале испытания пользователю %s: %s", user_id, e)
+
+
 async def send_challenge_message(bot: Bot, challenge_id: int):
     """
     Отправляет актуальное состояние испытания НОВЫМ сообщением и записывает его
