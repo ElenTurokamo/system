@@ -8,10 +8,10 @@ from aiogram import Bot
 
 logger = logging.getLogger(__name__)
 
-# 10 минут - автоудаление служебных сообщений (справка /help, файл со
+# 1 минута - автоудаление служебных сообщений (справка /help, файл со
 # статистикой), чтобы они не копились в чате, но пользователь успел их
 # прочитать/скачать.
-AUTO_DELETE_SECONDS = 10 * 60
+AUTO_DELETE_SECONDS = 60
 
 
 def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = AUTO_DELETE_SECONDS) -> None:
@@ -22,7 +22,7 @@ def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = AUTO_D
     вручную - просто тихо ничего не делает.
 
     Задача живёт только в памяти процесса: если бот перезапустится раньше, чем
-    истекут 10 минут, конкретное сообщение останется в чате - это не критично,
+    истекут AUTO_DELETE_SECONDS, конкретное сообщение останется в чате - это не критично,
     это чисто уборка чата, а не часть игровой логики.
     """
 
