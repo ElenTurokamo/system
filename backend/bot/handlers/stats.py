@@ -66,14 +66,16 @@ def _build_workbook(rows: list[dict]) -> io.BytesIO:
 async def cmd_get_stats_excel(message: Message):
     user = await db.get_user(message.from_user.id)
     if not user or user["reg_state"] != "done":
-        await message.answer("Ты ещё не зарегистрирован. Отправь /start.")
+        sent = await message.answer("Ты ещё не зарегистрирован. Отправь /start.")
+        schedule_delete(message.bot, sent.chat.id, sent.message_id)
         return
 
     rows = await db.get_stats_rows(message.from_user.id)
     if not rows:
-        await message.answer(
+        sent = await message.answer(
             "Пока нет ни одного завершённого дня - статистика появится после первого закрытого испытания."
         )
+        schedule_delete(message.bot, sent.chat.id, sent.message_id)
         return
 
     buffer = _build_workbook(rows)
