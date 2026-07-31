@@ -60,10 +60,11 @@ XP_PER_CHALLENGE_BASE = 100
 XP_REWARD_GROWTH = 0.08
 
 # Секретный бонус: если ВСЕ выбранные дисциплины довести до target * BONUS_MULTIPLIER,
-# начисляется XP, эквивалентный BONUS_LEVELS уровням от текущего уровня игрока
-# (один раз за испытание).
+# начисляется XP, равный BONUS_XP_MULTIPLIER наградам за обычное завершённое испытание
+# (то есть x3 от xp_reward_for_challenge на текущем уровне игрока) - весомо, но
+# без резких скачков уровня, которые сбивали прогрессию.
 BONUS_MULTIPLIER = 2
-BONUS_LEVELS = 5
+BONUS_XP_MULTIPLIER = 3
 
 
 def xp_required_for_level(level: int) -> int:

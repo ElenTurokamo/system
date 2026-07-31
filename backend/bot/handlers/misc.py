@@ -4,6 +4,7 @@ from aiogram.types import Message
 
 from bot import profile
 from bot.database import db
+from bot.utils import schedule_delete
 
 router = Router(name="misc")
 
@@ -40,14 +41,16 @@ async def cmd_profile(message: Message):
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(
+    sent = await message.answer(
         "/start — регистрация\n"
         "/profile — обновить и показать закреплённую сводку профиля\n"
         "/change_time — сменить время ежедневного испытания\n"
         "/change_focus — сменить дисциплины испытаний\n"
+        "/get_stats_excel — скачать статистику прокачки в Excel\n"
         "/bind_group — привязать текущую группу (вызывать внутри группы)\n"
         "/group_id — узнать ID текущей группы"
     )
+    schedule_delete(message.bot, sent.chat.id, sent.message_id)
 
 
 @router.message(F.chat.type == "private")

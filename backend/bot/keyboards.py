@@ -44,6 +44,11 @@ def challenge_kb(
         markers = []
         if p["completed"]:
             markers.append("✅")
+        if p["bonus_claimed"]:
+            # Личный x2 по этой дисциплине достигнут - только метка, дисциплина
+            # НЕ запечатывается: кнопка остаётся кликабельной, подходы можно
+            # вписывать и дальше (просто без доп.наград, только в статистику).
+            markers.append("🔒")
         if p["focus"] == active_focus:
             markers.append("🎯")
 

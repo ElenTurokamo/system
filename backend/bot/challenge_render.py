@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot
 
 from bot import keyboards as kb
-from bot.config import BONUS_LEVELS, BONUS_MULTIPLIER, FOCUS_OPTIONS, settings
+from bot.config import BONUS_MULTIPLIER, BONUS_XP_MULTIPLIER, FOCUS_OPTIONS, settings
 from bot.database import db
 
 logger = logging.getLogger(__name__)
@@ -92,7 +92,7 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
     lines: list[str] = []
     if challenge.get("bonus_claimed"):
         lines.append(
-            f"🎁 Секретный бонус получен: +{BONUS_LEVELS} уровней "
+            f"🎁 Секретный бонус получен: XP испытания x{BONUS_XP_MULTIPLIER} "
             f"(все дисциплины доведены до x{BONUS_MULTIPLIER})."
         )
 

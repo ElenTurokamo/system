@@ -5,11 +5,10 @@ from bot import challenge_render
 from bot import messages as tx
 from bot import profile
 from bot.config import (
-    BONUS_LEVELS,
     BONUS_MULTIPLIER,
+    BONUS_XP_MULTIPLIER,
     FOCUS_OPTIONS,
     settings,
-    xp_for_n_levels,
     xp_reward_for_challenge,
 )
 from bot.database import db
@@ -68,6 +67,16 @@ async def on_amount_logged(message: Message):
     await db.add_progress_amount(challenge["id"], focus_key, amount)
     await db.sync_progress_completed(challenge["id"], focus_key)
 
+    # Личный замочек 🔒 по этой конкретной дисциплине: чисто визуальная метка на
+    # кнопке, когда амплитуда по НЕЙ ОДНОЙ доведена до x2 цели. Никакой награды
+    # не даёт и НЕ мешает продолжать вписывать подходы дальше - дисциплина
+    # остаётся выбираемой, всё, что вписывается сверху, просто идёт в общий
+    # счётчик и в статистику. Общий секретный бонус (+5 уровней) по-прежнему
+    # считается отдельно ниже и требует x2 сразу по ВСЕМ выбранным дисциплинам.
+    progress_row = await db.get_progress(challenge["id"], focus_key)
+    if progress_row and not progress_row["bonus_claimed"] and progress_row["amount"] >= progress_row["target"] * BONUS_MULTIPLIER:
+        await db.mark_progress_bonus_claimed(challenge["id"], focus_key)
+
     # Секретный бонус: единоразово за ВСЁ испытание, только когда КАЖДАЯ выбранная
     # дисциплина доведена минимум до x2 своей цели - не за одну отдельную дисциплину.
     if not challenge["bonus_claimed"]:
@@ -75,7 +84,7 @@ async def on_amount_logged(message: Message):
         if rows and all(r["amount"] >= r["target"] * BONUS_MULTIPLIER for r in rows):
             await db.mark_challenge_bonus_claimed(challenge["id"])
             user = await db.get_user(message.from_user.id)
-            bonus_xp = xp_for_n_levels(user["level"], BONUS_LEVELS)
+            bonus_xp = xp_reward_for_challenge(user["level"]) * BONUS_XP_MULTIPLIER
             await db.add_xp(message.from_user.id, bonus_xp)
 
     # Испытание НЕ завершается автоматически: как только все цели закрыты, в сообщении
@@ -153,6 +162,7 @@ async def on_finish_challenge(call: CallbackQuery):
     await db.add_xp(call.from_user.id, reward)
     await db.increment_streak(call.from_user.id)
     await db.complete_challenge(challenge_id, with_photo=bool(challenge["physical_photo_posted"]))
+    await db.record_daily_stats(challenge_id)
 
     await challenge_render.push_challenge_update(call.bot, challenge_id)
     await profile.sync_profile_message(call.bot, call.from_user.id)
@@ -171,6 +181,7 @@ async def on_give_up(call: CallbackQuery):
         return
 
     await db.give_up_challenge(challenge_id)
+    await db.record_daily_stats(challenge_id)
     await db.reset_streak(call.from_user.id)
     # "Сдался" - это тоже пропущенный день: та же XP-плата и то же ограничение,
     # что и при обычной просрочке (см. scheduler.expire_stale_challenges).

@@ -65,7 +65,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Your SQLite database will live at `./data_storage/db.sql` on the host — it survives rebuilds.
+Your SQLite database will live at `./data_storage/db.sql` on the host — it survives rebuilds. This is mounted to a dedicated `/app/storage` path inside the container, separate from the bundled `/app/data` (message fragment bank), so the mount never shadows files baked into the image.
 
 ## 📁 Project structure
 
@@ -173,7 +173,7 @@ All configuration lives in `.env` (see `.env.example`):
 | `TIME_MORNING` / `TIME_DAY` / `TIME_EVENING` / `TIME_NIGHT` | Daily dispatch times (`HH:MM`) | `05:00` / `13:00` / `19:00` / `23:00` |
 | `CHALLENGE_TIMEOUT_HOURS` | Hours before an unfinished quest expires | `18` |
 | `PENALTY_HOURS` | Penalty duration after "Give Up" | `48` |
-| `DB_PATH` | Path to the SQLite file | `/app/data/db.sql` |
+| `DB_PATH` | Path to the SQLite file | `/app/storage/db.sql` |
 
 Per-focus daily targets, active-focus marker emojis, and the secret bonus multiplier/reward live in `bot/config.py` (`FOCUS_OPTIONS`, `BONUS_MULTIPLIER`, `BONUS_LEVELS`) rather than `.env`, since they're gameplay tuning rather than deployment config.
 

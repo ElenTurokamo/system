@@ -58,8 +58,27 @@ CREATE TABLE IF NOT EXISTS challenge_progress (
     target          INTEGER,
     amount          INTEGER DEFAULT 0,
     completed       INTEGER DEFAULT 0,   -- цель достигнута (amount >= target)
-    bonus_claimed   INTEGER DEFAULT 0,   -- секретный бонус х2 уже получен, дисциплина запечатана
+    bonus_claimed   INTEGER DEFAULT 0,   -- личный x2 по этой дисциплине достигнут - только метка для 🔒, наград не даёт
     FOREIGN KEY(challenge_id) REFERENCES challenges(id)
+);
+
+-- Отдельная таблица под историю прогрессии для выгрузки в Excel (/get_stats_excel).
+-- Хранится отдельно от users/challenges, чтобы не раздувать основные таблицы:
+-- здесь по одной строке на пользователя на календарный день (локальная дата
+-- по TZ из настроек), с итоговыми числами по каждой дисциплине за этот день.
+-- Строка создаётся/обновляется в момент закрытия испытания дня (завершено,
+-- сдался или просрочено) - см. Database.record_daily_stats.
+CREATE TABLE IF NOT EXISTS daily_stats (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER,
+    date            TEXT,               -- YYYY-MM-DD, локальная дата по TZ
+    pushups         INTEGER DEFAULT 0,
+    squats          INTEGER DEFAULT 0,
+    abs             INTEGER DEFAULT 0,
+    chess           INTEGER DEFAULT 0,
+    reading         INTEGER DEFAULT 0,
+    challenge_id    INTEGER,
+    UNIQUE(user_id, date)
 );
 """
 
@@ -109,6 +128,14 @@ class Database:
             if name not in existing_challenges:
                 await self._conn.execute(f"ALTER TABLE challenges ADD COLUMN {name} {col_type}")
                 changed = True
+
+        cur = await self._conn.execute("PRAGMA table_info(challenge_progress)")
+        existing_progress = {row[1] for row in await cur.fetchall()}
+        if "bonus_claimed" not in existing_progress:
+            await self._conn.execute(
+                "ALTER TABLE challenge_progress ADD COLUMN bonus_claimed INTEGER DEFAULT 0"
+            )
+            changed = True
 
         if changed:
             await self._conn.commit()
@@ -425,6 +452,20 @@ class Database:
         await self._conn.commit()
         return await self.get_progress(challenge_id, focus_key)
 
+    async def mark_progress_bonus_claimed(self, challenge_id: int, focus_key: str):
+        """
+        Личный x2 по конкретной дисциплине (amount >= target * BONUS_MULTIPLIER).
+        Только визуальная метка для замочка (🔒) на кнопке - никаких наград
+        сама по себе не даёт (общий бонус за x2 по ВСЕМ дисциплинам считается
+        отдельно в challenge.py) и НЕ запечатывает дисциплину: подходы можно
+        вписывать и дальше, они просто идут в статистику.
+        """
+        await self._conn.execute(
+            "UPDATE challenge_progress SET bonus_claimed = 1 WHERE challenge_id = ? AND focus = ?",
+            (challenge_id, focus_key),
+        )
+        await self._conn.commit()
+
     async def mark_progress_completed(self, challenge_id: int, focus_key: str):
         await self._conn.execute(
             "UPDATE challenge_progress SET completed = 1 WHERE challenge_id = ? AND focus = ?",
@@ -457,6 +498,74 @@ class Database:
         )
         row = await cur.fetchone()
         return row["cnt"] == 0
+
+    # ---------- daily stats (для /get_stats_excel) ----------
+
+    async def record_daily_stats(self, challenge_id: int):
+        """
+        Фиксирует итоговые числа по дисциплинам этого испытания в daily_stats -
+        по одной строке на пользователя на календарный день (локальная дата по
+        TZ из настроек, а не UTC, чтобы день не "съезжал" из-за разницы поясов).
+
+        Вызывается в момент закрытия испытания дня - неважно, завершено оно,
+        провалено (сдался) или сгорело по таймауту: игрок мог успеть вписать
+        часть повторений даже в проваленный день, и это тоже часть его прогрессии.
+
+        Если строка на эту дату уже есть (тот же день, например повторный
+        вызов), значения перезаписываются актуальными - на пользователя и день
+        всегда ровно одна строка.
+        """
+        from zoneinfo import ZoneInfo
+
+        challenge = await self.get_challenge(challenge_id)
+        if not challenge:
+            return
+
+        try:
+            started = datetime.fromisoformat(challenge["started_at"])
+            local_date = started.replace(tzinfo=ZoneInfo("UTC")).astimezone(
+                ZoneInfo(settings.tz)
+            ).date().isoformat()
+        except (TypeError, ValueError):
+            local_date = datetime.utcnow().date().isoformat()
+
+        amounts = {"pushups": 0, "squats": 0, "abs": 0, "chess": 0, "reading": 0}
+        rows = await self.get_progress_rows(challenge_id)
+        for r in rows:
+            if r["focus"] in amounts:
+                amounts[r["focus"]] = r["amount"]
+
+        await self._conn.execute(
+            """INSERT INTO daily_stats (user_id, date, pushups, squats, abs, chess, reading, challenge_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, date) DO UPDATE SET
+                   pushups = excluded.pushups,
+                   squats = excluded.squats,
+                   abs = excluded.abs,
+                   chess = excluded.chess,
+                   reading = excluded.reading,
+                   challenge_id = excluded.challenge_id""",
+            (
+                challenge["user_id"],
+                local_date,
+                amounts["pushups"],
+                amounts["squats"],
+                amounts["abs"],
+                amounts["chess"],
+                amounts["reading"],
+                challenge_id,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_stats_rows(self, user_id: int) -> list[dict]:
+        """Вся история дневной статистики пользователя, от старых дат к новым."""
+        cur = await self._conn.execute(
+            "SELECT * FROM daily_stats WHERE user_id = ? ORDER BY date ASC",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
 
 db = Database()

@@ -53,6 +53,7 @@ async def expire_stale_challenges(bot: Bot):
         user_id = challenge["user_id"]
 
         await db.expire_challenge(challenge["id"])
+        await db.record_daily_stats(challenge["id"])
         await db.reset_streak(user_id)
 
         # Пропущенный день - штраф: -300 XP (с понижением уровня, если сгорает
