@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS challenge_progress (
     target          INTEGER,
     amount          INTEGER DEFAULT 0,
     completed       INTEGER DEFAULT 0,   -- цель достигнута (amount >= target)
-    bonus_claimed   INTEGER DEFAULT 0,   -- личный x2 по этой дисциплине достигнут - только метка для 🔒, наград не даёт
+    bonus_claimed   INTEGER DEFAULT 0,   -- личный x2 по этой дисциплине достигнут - только метка для 🔥, наград не даёт
     FOREIGN KEY(challenge_id) REFERENCES challenges(id)
 );
 
@@ -405,6 +405,14 @@ class Database:
         )
         await self._conn.commit()
 
+    async def get_awaiting_challenges(self) -> list[dict]:
+        """Все испытания, которые сейчас активны (карточка ждёт действий игрока)."""
+        cur = await self._conn.execute(
+            "SELECT * FROM challenges WHERE status = 'awaiting_action'"
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def get_expirable_challenges(self, timeout_hours: int) -> list[dict]:
         cutoff = (datetime.utcnow() - timedelta(hours=timeout_hours)).isoformat()
         cur = await self._conn.execute(
@@ -452,19 +460,25 @@ class Database:
         await self._conn.commit()
         return await self.get_progress(challenge_id, focus_key)
 
-    async def mark_progress_bonus_claimed(self, challenge_id: int, focus_key: str):
+    async def sync_progress_bonus(self, challenge_id: int, focus_key: str, bonus_multiplier: int):
         """
-        Личный x2 по конкретной дисциплине (amount >= target * BONUS_MULTIPLIER).
-        Только визуальная метка для замочка (🔒) на кнопке - никаких наград
-        сама по себе не даёт (общий бонус за x2 по ВСЕМ дисциплинам считается
-        отдельно в challenge.py) и НЕ запечатывает дисциплину: подходы можно
-        вписывать и дальше, они просто идут в статистику.
+        Приводит флаг bonus_claimed (личный x2 по этой дисциплине, метка 🔥 на
+        кнопке) в соответствие текущему amount/target - в обе стороны, точно
+        так же, как sync_progress_completed делает это для completed. amount
+        может не только расти, но и уменьшаться (исправление ошибочно
+        введённого числа), а значит метка должна и сниматься, если amount
+        снова опустился ниже target * bonus_multiplier.
         """
-        await self._conn.execute(
-            "UPDATE challenge_progress SET bonus_claimed = 1 WHERE challenge_id = ? AND focus = ?",
-            (challenge_id, focus_key),
-        )
-        await self._conn.commit()
+        row = await self.get_progress(challenge_id, focus_key)
+        if not row:
+            return
+        should_be_claimed = 1 if row["amount"] >= row["target"] * bonus_multiplier else 0
+        if row["bonus_claimed"] != should_be_claimed:
+            await self._conn.execute(
+                "UPDATE challenge_progress SET bonus_claimed = ? WHERE challenge_id = ? AND focus = ?",
+                (should_be_claimed, challenge_id, focus_key),
+            )
+            await self._conn.commit()
 
     async def mark_progress_completed(self, challenge_id: int, focus_key: str):
         await self._conn.execute(

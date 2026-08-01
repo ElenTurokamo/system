@@ -30,6 +30,28 @@ class Settings:
         default_factory=lambda: int(_env("MISSED_DAY_XP_PENALTY", "300"))
     )
 
+    # ---------- Автобэкап БД в приватный GitHub-репозиторий ----------
+    # Если BACKUP_REPO_URL пустой - автобэкап просто не регистрируется в
+    # планировщике (см. scheduler.setup_scheduler), никакой ошибки не будет.
+    backup_repo_url: str = field(default_factory=lambda: _env("BACKUP_REPO_URL", ""))
+    # Personal Access Token с правом push в этот репозиторий (repo scope).
+    # Вшивается в HTTPS-урл на лету, в открытом виде нигде не логируется.
+    backup_github_token: str = field(default_factory=lambda: _env("BACKUP_GITHUB_TOKEN", ""))
+    backup_git_user_name: str = field(
+        default_factory=lambda: _env("BACKUP_GIT_USER_NAME", "solo-leveling-bot")
+    )
+    backup_git_user_email: str = field(
+        default_factory=lambda: _env("BACKUP_GIT_USER_EMAIL", "backup@bot.local")
+    )
+    # Два дня в неделю (cron day_of_week: mon/tue/wed/thu/fri/sat/sun), максимально
+    # равноудалённых друг от друга на 7-дневной неделе (3 и 4 дня между ними).
+    backup_day_1: str = field(default_factory=lambda: _env("BACKUP_DAY_1", "mon"))
+    backup_day_2: str = field(default_factory=lambda: _env("BACKUP_DAY_2", "thu"))
+    backup_time: str = field(default_factory=lambda: _env("BACKUP_TIME", "04:00"))
+    # Если задан - в этот чат бот пришлёт сообщение, когда пуш бэкапа не удался
+    # (например, просрочен токен). Необязательно.
+    backup_notify_chat_id: str = field(default_factory=lambda: _env("BACKUP_NOTIFY_CHAT_ID", ""))
+
     @property
     def time_slots(self) -> dict:
         return {

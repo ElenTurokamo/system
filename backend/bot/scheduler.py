@@ -4,6 +4,7 @@ from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from bot import backup
 from bot import challenge_render
 from bot import messages as tx
 from bot import profile
@@ -72,6 +73,17 @@ async def expire_stale_challenges(bot: Bot):
         await profile.sync_profile_message(bot, user_id)
 
 
+async def refresh_challenge_timers(bot: Bot):
+    """
+    Перерисовывает карточку испытания каждому игроку с активным (awaiting_action)
+    испытанием, чтобы таймер "До провала испытания осталось..." шёл в реальном
+    времени, а не замирал до следующего действия игрока в карточке.
+    """
+    challenges = await db.get_awaiting_challenges()
+    for challenge in challenges:
+        await challenge_render.push_challenge_update(bot, challenge["id"])
+
+
 async def refresh_penalty_profiles(bot: Bot):
     """
     Перерисовывает профиль каждому игроку с активным (или только что истёкшим)
@@ -115,5 +127,34 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="penalty_refresh",
         replace_existing=True,
     )
+
+    # Обновление таймера "до провала испытания" в карточке испытания - раз в минуту
+    scheduler.add_job(
+        refresh_challenge_timers,
+        "interval",
+        minutes=1,
+        args=[bot],
+        id="challenge_timer_refresh",
+        replace_existing=True,
+    )
+
+    # Автобэкап БД в приватный GitHub-репозиторий - дважды в неделю, в дни,
+    # максимально равноудалённые друг от друга (по умолчанию пн/чт). Если
+    # BACKUP_REPO_URL не задан - job просто не регистрируется.
+    if settings.backup_repo_url:
+        b_hour, b_minute = map(int, settings.backup_time.split(":"))
+        scheduler.add_job(
+            backup.run_backup,
+            CronTrigger(
+                day_of_week=f"{settings.backup_day_1},{settings.backup_day_2}",
+                hour=b_hour,
+                minute=b_minute,
+            ),
+            args=[bot],
+            id="db_backup",
+            replace_existing=True,
+        )
+    else:
+        logger.info("BACKUP_REPO_URL не задан - автобэкап БД в git отключён.")
 
     return scheduler
