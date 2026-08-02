@@ -104,9 +104,25 @@ def success(streak: int, xp_gained: int, xp: int, level: int) -> str:
     return _compose("success", streak=streak, xp_gained=xp_gained, xp=xp, level=level)
 
 
-def photo_caption(streak: int, user_id: int) -> str:
-    template = random.choice(_BANK["photo_posted"]["templates"])
-    return template.format(streak=streak, user_id=user_id)
+def photo_caption(streak: int, user_id: int, physical_bonus_claimed: bool = False) -> str:
+    """
+    Ежедневный отчёт в группу (подпись к фото выполнения физических дисциплин).
+    Формат жёстко фиксирован - без "воды" из банка случайных фраз (как и у
+    challenge_start): один и тот же текст день за днём, меняются только
+    streak/user_id.
+
+    physical_bonus_claimed - личный x2 достигнут по ВСЕМ выбранным физическим
+    дисциплинам (см. Database.physical_bonus_achieved). Это НЕ то же самое, что
+    полный секретный бонус challenges.bonus_claimed (x2 XP), который требует x2
+    сразу по всем дисциплинам, включая интеллектуальные, и даётся независимо от
+    этого отчёта при закрытии всего испытания - используем более узкий,
+    "физический" критерий специально для этой строки, чтобы не заставлять
+    задерживать фото-отчёт ради шахмат/чтения, пока не прошёл памп.
+    """
+    text = f"Отчёт дня {streak}. Игрок {user_id} завершил испытание."
+    if physical_bonus_claimed:
+        text += f"\n\n🌟 В день {streak} также пройдено секретное испытание."
+    return text
 
 
 def give_up(xp_loss: int = 0, penalty_hours: int = 0) -> str:

@@ -449,6 +449,22 @@ class Database:
         row = await cur.fetchone()
         return dict(row) if row else None
 
+    async def physical_bonus_achieved(self, challenge_id: int) -> bool:
+        """
+        Личный x2 достигнут по КАЖДОЙ выбранной ФИЗИЧЕСКОЙ дисциплине (без учёта
+        интеллектуальных - шахмат/чтения). Используется отдельно от общего
+        секретного бонуса (challenges.bonus_claimed, который требует x2 сразу по
+        ВСЕМ выбранным дисциплинам и даёт награду x2 XP) - специально для отметки
+        в ежедневном фото-отчёте в группу: физический прогресс оценивается по
+        мышцам сразу после тренировки, пока не прошёл памп, поэтому не должен
+        зависеть от того, успел ли игрок ещё и закрыть интеллектуальную часть.
+        Опирается на per-focus флаг bonus_claimed в challenge_progress, который
+        синкается на каждый залогированный подход (см. Database.sync_progress_bonus).
+        """
+        rows = await self.get_progress_rows(challenge_id)
+        physical_rows = [r for r in rows if FOCUS_OPTIONS[r["focus"]]["kind"] == "physical"]
+        return bool(physical_rows) and all(r["bonus_claimed"] for r in physical_rows)
+
     async def add_progress_amount(self, challenge_id: int, focus_key: str, amount: int) -> dict:
         """Добавляет подход к прогрессу по фокусу (может быть отрицательным - исправление
         ошибочно введённого числа) и возвращает обновлённую строку. Не даёт уйти ниже 0."""

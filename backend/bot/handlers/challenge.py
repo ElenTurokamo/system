@@ -114,7 +114,19 @@ async def on_photo_received(message: Message, bot):
     user = await db.get_user(message.from_user.id)
     posted = False
     if user["group_id"]:
-        caption = tx.photo_caption(user["streak"], message.from_user.id)
+        # Секретная строка в отчёте оценивается ТОЛЬКО по физическим дисциплинам
+        # (см. Database.physical_bonus_achieved) - специально не завязана на
+        # общий challenges.bonus_claimed (который требует x2 ещё и по
+        # интеллектуальным дисциплинам): иначе пришлось бы тянуть с отчётом до
+        # закрытия шахмат/чтения, а по мышцам прогресс тренировки оценить уже
+        # не получится, памп пройдёт. Полный бонус (x2 XP) от этого никак не
+        # зависит и по-прежнему даётся только при закрытии ВСЕГО испытания.
+        physical_bonus = await db.physical_bonus_achieved(challenge["id"])
+        caption = tx.photo_caption(
+            user["streak"],
+            message.from_user.id,
+            physical_bonus_claimed=physical_bonus,
+        )
         try:
             await bot.send_photo(user["group_id"], message.photo[-1].file_id, caption=caption)
             posted = True
