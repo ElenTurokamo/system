@@ -69,16 +69,23 @@ def penalty_block(user: dict) -> str:
 
 def player_code(user: dict) -> str:
     """
-    Уникальный короткий код игрока: дата регистрации (ГГММДД) + первые 5 цифр ID.
-    Например, зарегистрировался 28.07.2026, ID 987654321 -> 260728-98765.
+    Уникальный короткий код игрока: дата регистрации (ГГММДД) + полный user_id.
+    Например, зарегистрировался 28.07.2026, ID 987654321 -> 260728-987654321.
+
+    ВАЖНО: раньше вторая часть обрезалась до первых 5 цифр user_id - это было
+    нормально, пока код был чисто декоративным. Теперь он служит ключом поиска
+    для /add_friend (см. Database.find_user_by_player_code), а первые 5 цифр
+    telegram user_id совсем не гарантируют уникальность (у двух разных ID может
+    начинаться одинаково) - обрезка могла привести к тому, что заявка в друзья
+    случайно уйдёт не тому человеку. Полный user_id уникален по определению
+    (это PRIMARY KEY таблицы users), поэтому здесь он не обрезается.
     """
     try:
         registered = datetime.fromisoformat(user["registered_at"])
         date_part = registered.strftime("%y%m%d")
     except (TypeError, ValueError):
         date_part = "000000"
-    id_part = str(user["user_id"])[:5]
-    return f"{date_part}-{id_part}"
+    return f"{date_part}-{user['user_id']}"
 
 
 def display_name(user: dict) -> str:
@@ -93,7 +100,7 @@ def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claime
 
     header = (
         "『Профиль Игрока』\n\n"
-        f"🆔 {display_name(user)} · #{player_code(user)}\n"
+        f"🆔 {display_name(user)} · #<code>{player_code(user)}</code>\n"
         f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
         f"🔥 Серия: {streak} {ru_days(streak)}\n\n"
         f"⏰ Время испытаний: {time_label}\n"

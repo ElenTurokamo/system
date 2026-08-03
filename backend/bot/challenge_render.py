@@ -66,6 +66,30 @@ def _physical_photo_pending(challenge: dict, progress_rows: list[dict]) -> bool:
     return bool(physical_rows) and all(r["completed"] for r in physical_rows)
 
 
+async def _build_cheer_line(challenge_id: int) -> str:
+    """
+    Компактная строка про поддержку от друзей: "🤝 Верят в тебя: Аня, Игорь" -
+    ОДНА строка независимо от числа поддержавших (см. friends_list-концепцию,
+    п.6.3), а не по строке на каждого, чтобы не раздувать и без того насыщенную
+    карточку испытания (таймер, прогресс, кнопки).
+    """
+    from bot.profile import display_name  # локальный импорт - избегаем цикла profile <-> challenge_render
+
+    supporter_ids = await db.get_cheer_supporter_ids(challenge_id)
+    if not supporter_ids:
+        return ""
+
+    names = []
+    for supporter_id in supporter_ids:
+        supporter = await db.get_user(supporter_id)
+        if supporter:
+            names.append(display_name(supporter))
+    if not names:
+        return ""
+
+    return f"🤝 Верят в тебя: {', '.join(names)}"
+
+
 async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
     status = challenge["status"]
     quest = challenge["quest_text"] or ""
@@ -77,6 +101,7 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
         #   (динамическая надпись)       <- случайная строка из _QUEST_TAGLINES
         #
         #   (подсказка про фото)         <- только пока не все физ. цели закрыты/фото не отправлено
+        #   (строка поддержки от друзей) <- только если хотя бы один друг нажал "Поддержать"
         #   ===========================
         #   ⏱️ таймер
         # Статус бонуса и выбранная дисциплина текстом не дублируются - они видны
@@ -86,6 +111,11 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
         text = quest
         if _physical_photo_pending(challenge, progress_rows):
             text += "\n\n📸 Пришли фото выполнения всех физических активностей."
+
+        cheer_line = await _build_cheer_line(challenge["id"])
+        if cheer_line:
+            text += f"\n\n{cheer_line}"
+
         text += f"\n\n{DIVIDER}\n{_format_time_left(challenge)}"
         return text
 

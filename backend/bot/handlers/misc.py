@@ -47,6 +47,8 @@ async def cmd_help(message: Message):
         "/change_time — сменить время ежедневного испытания\n"
         "/change_focus — сменить дисциплины испытаний\n"
         "/get_stats_excel — скачать статистику прокачки в Excel\n"
+        "/add_friend — добавить друга по его коду игрока\n"
+        "/friendlist — список друзей и их прогресс\n"
         "/bind_group — привязать текущую группу (вызывать внутри группы)\n"
         "/group_id — узнать ID текущей группы"
     )
@@ -61,9 +63,10 @@ async def on_spam_message(message: Message):
     неуместные фото и т.п. Молча удаляем - никакой реакции бота на такие сообщения
     не предусмотрено, чат с игроком должен оставаться чистым.
 
-    Команды сюда не долетают - их удаляет DeleteCommandsMiddleware, а числа
+    Команды сюда не долетают - их удаляет DeleteCommandsMiddleware, числа
     повторений (в т.ч. отрицательные) обрабатывает и удаляет сам on_amount_logged
-    в challenge.py, до того как апдейт дойдёт до этого роутера.
+    в challenge.py, а код друга для /add_friend - on_friend_code_entered в
+    handlers/friends.py, до того как апдейт дойдёт до этого роутера.
     """
     try:
         await message.delete()

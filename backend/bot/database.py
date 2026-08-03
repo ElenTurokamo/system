@@ -80,6 +80,35 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     challenge_id    INTEGER,
     UNIQUE(user_id, date)
 );
+
+-- Список друзей (/add_friend, /friendlist). Заявка не одностороняя: пока
+-- addressee не подтвердил, status='pending' и addressee не получает доступа
+-- к данным requester (и наоборот). Одна строка на пару (requester, addressee)
+-- в направлении, в котором была отправлена заявка изначально - дружба, будучи
+-- принятой, считается двусторонней (см. Database.get_friend_ids), повторная
+-- заявка в обратную сторону не создаёт вторую строку (см. find_friendship).
+CREATE TABLE IF NOT EXISTS friendships (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    requester_id    INTEGER,
+    addressee_id    INTEGER,
+    status          TEXT DEFAULT 'pending',  -- pending / accepted
+    created_at      TEXT,
+    responded_at    TEXT,
+    UNIQUE(requester_id, addressee_id)
+);
+
+-- "Поддержать" в брифе друга (см. bot/handlers/friends.py). Метка на пару
+-- (конкретное испытание, конкретный поддержавший) - двусторонний sync (тоггл),
+-- а не одностороннее добавление строки, чтобы один и тот же друг не мог
+-- нажать кнопку многократно за одно испытание (та же логика, что и у 🔥
+-- личного бонуса в challenge_progress).
+CREATE TABLE IF NOT EXISTS challenge_cheers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    challenge_id    INTEGER,
+    supporter_id    INTEGER,
+    created_at      TEXT,
+    UNIQUE(challenge_id, supporter_id)
+);
 """
 
 
@@ -107,6 +136,8 @@ class Database:
             "profile_message_id": "INTEGER",
             "failure_chat_id": "INTEGER",
             "failure_message_id": "INTEGER",
+            "awaiting_friend_code": "INTEGER DEFAULT 0",
+            "friend_prompt_message_id": "INTEGER",
         }
         changed = False
         for name, col_type in new_user_columns.items():
@@ -596,6 +627,123 @@ class Database:
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- friend-add flow (/add_friend) ----------
+
+    async def set_awaiting_friend_code(self, user_id: int, prompt_message_id: Optional[int]):
+        """
+        Включает/выключает режим ожидания player_code от игрока (prompt_message_id
+        задан -> ждём, None -> сброс). Хранится прямо на users, а не в отдельном
+        FSM-сторадже - тем же паттерном, что last_reg_message_id у регистрации.
+        """
+        await self._conn.execute(
+            "UPDATE users SET awaiting_friend_code = ?, friend_prompt_message_id = ? WHERE user_id = ?",
+            (1 if prompt_message_id else 0, prompt_message_id, user_id),
+        )
+        await self._conn.commit()
+
+    async def find_user_by_player_code(self, code: str) -> Optional[dict]:
+        """
+        player_code (см. profile.player_code) не хранится отдельной колонкой -
+        он целиком выводится из registered_at + user_id, поэтому ищем перебором
+        по всем зарегистрированным пользователям. При масштабе "закрытый круг
+        друзей" (а не публичный сервис на тысячи пользователей) это дёшево и
+        не требует денормализации схемы ради одной редкой операции поиска.
+        """
+        from bot.profile import player_code as _player_code
+
+        cur = await self._conn.execute("SELECT * FROM users WHERE reg_state = 'done'")
+        rows = await cur.fetchall()
+        for row in rows:
+            user = dict(row)
+            if _player_code(user) == code:
+                return user
+        return None
+
+    # ---------- friendships (/friendlist) ----------
+
+    async def find_friendship(self, user_a: int, user_b: int) -> Optional[dict]:
+        """Заявка/дружба между этими двумя людьми в ЛЮБОМ направлении, если есть."""
+        cur = await self._conn.execute(
+            """SELECT * FROM friendships
+               WHERE (requester_id = ? AND addressee_id = ?)
+                  OR (requester_id = ? AND addressee_id = ?)""",
+            (user_a, user_b, user_b, user_a),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def create_friend_request(self, requester_id: int, addressee_id: int) -> int:
+        cur = await self._conn.execute(
+            """INSERT INTO friendships (requester_id, addressee_id, status, created_at)
+               VALUES (?, ?, 'pending', ?)""",
+            (requester_id, addressee_id, datetime.utcnow().isoformat()),
+        )
+        await self._conn.commit()
+        return cur.lastrowid
+
+    async def get_friendship(self, friendship_id: int) -> Optional[dict]:
+        cur = await self._conn.execute("SELECT * FROM friendships WHERE id = ?", (friendship_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def accept_friendship(self, friendship_id: int):
+        await self._conn.execute(
+            "UPDATE friendships SET status = 'accepted', responded_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), friendship_id),
+        )
+        await self._conn.commit()
+
+    async def delete_friendship(self, friendship_id: int):
+        await self._conn.execute("DELETE FROM friendships WHERE id = ?", (friendship_id,))
+        await self._conn.commit()
+
+    async def get_friend_ids(self, user_id: int) -> list[int]:
+        """ID всех ПРИНЯТЫХ друзей - дружба двусторонняя, неважно, кто был инициатором."""
+        cur = await self._conn.execute(
+            """SELECT requester_id, addressee_id FROM friendships
+               WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)""",
+            (user_id, user_id),
+        )
+        rows = await cur.fetchall()
+        friend_ids = []
+        for row in rows:
+            other = row["addressee_id"] if row["requester_id"] == user_id else row["requester_id"]
+            friend_ids.append(other)
+        return friend_ids
+
+    # ---------- поддержка друга (challenge_cheers) ----------
+
+    async def toggle_cheer(self, challenge_id: int, supporter_id: int) -> bool:
+        """
+        Тоггл "поддержки" (та же idея, что и у sync_progress_bonus - отметить/снять,
+        а не одностороннее добавление). Возвращает True, если поддержка теперь
+        ВКЛЮЧЕНА (запись создана), False - если только что снята.
+        """
+        existing = await self._conn.execute(
+            "SELECT id FROM challenge_cheers WHERE challenge_id = ? AND supporter_id = ?",
+            (challenge_id, supporter_id),
+        )
+        row = await existing.fetchone()
+        if row:
+            await self._conn.execute("DELETE FROM challenge_cheers WHERE id = ?", (row["id"],))
+            await self._conn.commit()
+            return False
+
+        await self._conn.execute(
+            "INSERT INTO challenge_cheers (challenge_id, supporter_id, created_at) VALUES (?, ?, ?)",
+            (challenge_id, supporter_id, datetime.utcnow().isoformat()),
+        )
+        await self._conn.commit()
+        return True
+
+    async def get_cheer_supporter_ids(self, challenge_id: int) -> list[int]:
+        cur = await self._conn.execute(
+            "SELECT supporter_id FROM challenge_cheers WHERE challenge_id = ? ORDER BY id ASC",
+            (challenge_id,),
+        )
+        rows = await cur.fetchall()
+        return [r["supporter_id"] for r in rows]
 
 
 db = Database()

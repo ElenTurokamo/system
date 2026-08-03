@@ -81,3 +81,48 @@ def challenge_kb(
 
     rows.append([InlineKeyboardButton(text="🏳 Сдаться", callback_data=f"giveup:{challenge_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def friend_request_kb(friendship_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="✅", callback_data=f"freq:{friendship_id}:accept"),
+            InlineKeyboardButton(text="❌", callback_data=f"freq:{friendship_id}:decline"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def friend_list_kb(friend_rows: list[dict], page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    for f in friend_rows:
+        text = f"{f['name']} {f['icon']}"
+        rows.append(
+            [InlineKeyboardButton(text=text, callback_data=f"flist:open:{f['user_id']}:{page}")]
+        )
+
+    # Стрелочки листания - только если друзей больше, чем помещается на одну
+    # страницу (см. friends.PAGE_SIZE), иначе строка навигации просто не нужна.
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"flist:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="flist:noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"flist:page:{page + 1}"))
+        rows.append(nav)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def friend_brief_kb(
+    friend_user_id: int, page: int, show_cheer: bool, cheering: bool
+) -> InlineKeyboardMarkup:
+    rows = []
+    if show_cheer:
+        label = "💛 Поддержка отправлена" if cheering else "🤝 Поддержать"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"flist:cheer:{friend_user_id}:{page}")]
+        )
+    rows.append([InlineKeyboardButton(text="⬅ Назад", callback_data=f"flist:page:{page}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
