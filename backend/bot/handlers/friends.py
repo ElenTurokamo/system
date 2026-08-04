@@ -18,15 +18,17 @@ from bot import keyboards as kb
 from bot.config import level_from_total_xp
 from bot.database import db
 from bot.profile import display_name
-from bot.utils import schedule_delete
+from bot.utils import AUTO_DELETE_SECONDS, schedule_delete, send_command_message
 
 logger = logging.getLogger(__name__)
 router = Router(name="friends")
 
-# Если игрок не ответил на запрос кода друга - не держим состояние "ждём код"
-# вечно (иначе следующее случайное текстовое сообщение улетело бы в поиск по
-# коду). Подобрано равным общему таймауту ephemeral-сообщений бота.
-FRIEND_CODE_PROMPT_TIMEOUT = 60
+NOT_REGISTERED = "Сначала пройди регистрацию: /start"
+
+# Единая формулировка для карточки запроса кода - без пояснений "где искать",
+# аудитория не нуждается в подсказках такого уровня; тон - как и везде в
+# боте, короткая прямая команда, а не объяснение с примером.
+FRIEND_CODE_PROMPT = "Введи код игрока (см. /profile) - отправлю запрос в отряд."
 
 
 async def _is_awaiting_friend_code(message: Message) -> bool:
@@ -37,10 +39,18 @@ async def _is_awaiting_friend_code(message: Message) -> bool:
 
 
 async def _expire_friend_prompt(bot: Bot, user_id: int, prompt_message_id: int) -> None:
-    await asyncio.sleep(FRIEND_CODE_PROMPT_TIMEOUT)
+    """
+    Если игрок не ответил на запрос кода за AUTO_DELETE_SECONDS - снимаем режим
+    ожидания (иначе следующее случайное текстовое сообщение улетело бы в поиск
+    по коду). Сверяемся не с самим фактом ожидания, а с ИМЕННО ЭТИМ message_id:
+    если игрок уже успел вызвать /add_friend заново, friend_prompt_message_id
+    в базе будет указывать на новый промпт, и эта устаревшая задача должна
+    тихо выйти, а не затереть актуальное состояние.
+    """
+    await asyncio.sleep(AUTO_DELETE_SECONDS)
     user = await db.get_user(user_id)
-    if not user or not user.get("awaiting_friend_code"):
-        return  # уже ответили - обработчик кода сам всё убрал
+    if not user or user.get("friend_prompt_message_id") != prompt_message_id:
+        return
     await db.set_awaiting_friend_code(user_id, None)
     try:
         await bot.delete_message(user_id, prompt_message_id)
@@ -54,45 +64,36 @@ async def cmd_add_friend(message: Message, bot: Bot):
     /add_friend сама (как и любая другая команда) удаляется автоматически
     DeleteCommandsMiddleware сразу после обработки - здесь только просим код и
     ждём ответа. Всё, что появится дальше по ходу этой команды (подсказка,
-    ответ игрока), тоже будет удалено - см. on_friend_code_entered.
+    ответ игрока), живёт под одним и тем же command_key "add_friend" - значит,
+    новое сообщение всегда убирает предыдущее (см. send_command_message), в
+    том числе сам промпт исчезает, как только придёт итог: успех или ошибка.
     """
     user = await db.get_user(message.from_user.id)
     if not user or user["reg_state"] != "done":
-        sent = await message.answer("Ты ещё не зарегистрирован. Отправь /start.")
-        schedule_delete(bot, sent.chat.id, sent.message_id)
+        await send_command_message(bot, message.chat.id, "add_friend", NOT_REGISTERED)
         return
 
-    prompt = await message.answer(
-        "Пришли код игрока друга (он есть у него в /profile, например "
-        "<code>260728-987654321</code>) - отправлю ему запрос в друзья."
-    )
+    prompt = await send_command_message(bot, message.chat.id, "add_friend", FRIEND_CODE_PROMPT)
     await db.set_awaiting_friend_code(message.from_user.id, prompt.message_id)
     asyncio.create_task(_expire_friend_prompt(bot, message.from_user.id, prompt.message_id))
 
 
 @router.message(_is_awaiting_friend_code)
 async def on_friend_code_entered(message: Message, bot: Bot):
-    user = await db.get_user(message.from_user.id)
     code = (message.text or "").strip()
 
-    # Чистим и код, и подсказку сразу - "всё, связанное с этой командой,
-    # удалится" (см. постановку задачи), независимо от исхода поиска ниже.
+    # Сообщение игрока с кодом само по себе - лишний "мусор" в чате, чистим
+    # сразу, независимо от исхода поиска ниже.
     try:
         await message.delete()
     except Exception:
         pass
-    prompt_message_id = user.get("friend_prompt_message_id")
-    if prompt_message_id:
-        try:
-            await bot.delete_message(message.chat.id, prompt_message_id)
-        except Exception:
-            pass
     await db.set_awaiting_friend_code(message.from_user.id, None)
 
     target = await db.find_user_by_player_code(code)
     error = None
     if not target:
-        error = "Код не найден. Проверь его в /profile у друга и попробуй /add_friend ещё раз."
+        error = "Код не найден. Проверь его через /profile и повтори /add_friend."
     elif target["user_id"] == message.from_user.id:
         error = "Нельзя добавить в друзья самого себя."
     else:
@@ -103,8 +104,9 @@ async def on_friend_code_entered(message: Message, bot: Bot):
             error = "Запрос уже отправлен, ждём ответа."
 
     if error:
-        sent = await message.answer(error)
-        schedule_delete(bot, sent.chat.id, sent.message_id)
+        # Один и тот же command_key "add_friend" - это сообщение заменит
+        # собой промпт "Введи код игрока...", он не остаётся висеть рядом.
+        await send_command_message(bot, message.chat.id, "add_friend", error)
         return
 
     friendship_id = await db.create_friend_request(message.from_user.id, target["user_id"])
@@ -122,14 +124,15 @@ async def on_friend_code_entered(message: Message, bot: Bot):
     except Exception as e:
         logger.info("Не удалось отправить запрос в друзья пользователю %s: %s", target["user_id"], e)
         await db.delete_friendship(friendship_id)
-        sent = await message.answer(
-            "Не удалось отправить запрос - похоже, друг ещё не писал этому боту."
+        await send_command_message(
+            bot, message.chat.id, "add_friend",
+            "Не удалось отправить запрос - похоже, друг ещё не писал этому боту.",
         )
-        schedule_delete(bot, sent.chat.id, sent.message_id)
         return
 
-    sent = await message.answer(f"Запрос в друзья отправлен игроку {display_name(target)}.")
-    schedule_delete(bot, sent.chat.id, sent.message_id)
+    await send_command_message(
+        bot, message.chat.id, "add_friend", f"Запрос в друзья отправлен игроку {display_name(target)}."
+    )
 
 
 @router.callback_query(F.data.startswith("freq:"))
@@ -171,14 +174,12 @@ async def on_friend_request_response(call: CallbackQuery, bot: Bot):
 async def cmd_friendlist(message: Message, bot: Bot):
     user = await db.get_user(message.from_user.id)
     if not user or user["reg_state"] != "done":
-        sent = await message.answer("Ты ещё не зарегистрирован. Отправь /start.")
-        schedule_delete(bot, sent.chat.id, sent.message_id)
+        await send_command_message(bot, message.chat.id, "friendlist", NOT_REGISTERED)
         return
 
     friend_rows = await friends.build_friend_rows(message.from_user.id)
     text, markup = friends.render_list(friend_rows, page=0)
-    sent = await message.answer(text, reply_markup=markup)
-    schedule_delete(bot, sent.chat.id, sent.message_id)
+    await send_command_message(bot, message.chat.id, "friendlist", text, reply_markup=markup)
 
 
 @router.callback_query(F.data == "flist:noop")
@@ -196,7 +197,7 @@ async def on_flist_page(call: CallbackQuery, bot: Bot):
         await call.message.edit_text(text, reply_markup=markup)
     except Exception:
         pass
-    # Любое взаимодействие со списком продлевает ему жизнь ещё на минуту -
+    # Любое взаимодействие со списком продлевает ему жизнь ещё на AUTO_DELETE_SECONDS -
     # иначе он мог бы исчезнуть прямо во время листания/чтения брифа.
     schedule_delete(bot, call.message.chat.id, call.message.message_id)
     await call.answer()

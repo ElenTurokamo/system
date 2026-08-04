@@ -12,7 +12,7 @@ users/challenges - чтобы не раздувать основные табл�
 """
 import io
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message
 from openpyxl import Workbook
@@ -20,7 +20,7 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from bot.database import db
-from bot.utils import schedule_delete
+from bot.utils import replace_command_message, send_command_message, track_command_message
 
 router = Router(name="stats")
 
@@ -63,22 +63,27 @@ def _build_workbook(rows: list[dict]) -> io.BytesIO:
 
 
 @router.message(Command("get_stats_excel"))
-async def cmd_get_stats_excel(message: Message):
+async def cmd_get_stats_excel(message: Message, bot: Bot):
     user = await db.get_user(message.from_user.id)
     if not user or user["reg_state"] != "done":
-        sent = await message.answer("Ты ещё не зарегистрирован. Отправь /start.")
-        schedule_delete(message.bot, sent.chat.id, sent.message_id)
+        await send_command_message(bot, message.chat.id, "get_stats_excel", "Сначала пройди регистрацию: /start")
         return
 
     rows = await db.get_stats_rows(message.from_user.id)
     if not rows:
-        sent = await message.answer(
-            "Пока нет ни одного завершённого дня - статистика появится после первого закрытого испытания."
+        await send_command_message(
+            bot, message.chat.id, "get_stats_excel",
+            "Пока нет ни одного завершённого дня - статистика появится после первого закрытого испытания.",
         )
-        schedule_delete(message.bot, sent.chat.id, sent.message_id)
         return
 
     buffer = _build_workbook(rows)
     file = BufferedInputFile(buffer.read(), filename="solo_leveling_stats.xlsx")
+
+    # Документ отправляется отдельным вызовом (answer_document), поэтому
+    # используем replace/track напрямую вместо send_command_message - но то же
+    # правило "одно сообщение на команду" сохраняется: старый файл/ошибка этой
+    # же команды убирается перед отправкой нового.
+    await replace_command_message(bot, message.chat.id, "get_stats_excel")
     sent = await message.answer_document(file, caption="📊 Твоя статистика прокачки по дням.")
-    schedule_delete(message.bot, sent.chat.id, sent.message_id)
+    track_command_message(bot, message.chat.id, "get_stats_excel", sent.message_id)

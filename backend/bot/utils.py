@@ -8,16 +8,24 @@ from aiogram import Bot
 
 logger = logging.getLogger(__name__)
 
-# 1 минута - автоудаление служебных сообщений (справка /help, файл со
-# статистикой), чтобы они не копились в чате, но пользователь успел их
-# прочитать/скачать.
-AUTO_DELETE_SECONDS = 60
+# 30 секунд - автоудаление служебных ephemeral-сообщений (справка /help,
+# список друзей, запрос кода друга, файл со статистикой и т.п.), чтобы они не
+# копились в чате, но пользователь успел их прочитать/скачать.
+AUTO_DELETE_SECONDS = 30
 
 # Активные задачи автоудаления по (chat_id, message_id) - нужны, чтобы уметь
 # СБРАСЫВАТЬ обратный отсчёт (см. schedule_delete), когда пользователь
 # продолжает взаимодействовать с сообщением (например, кликает по другу в
 # /friendlist) - иначе оно может исчезнуть прямо у него из-под пальцев.
 _delete_tasks: dict[tuple[int, int], asyncio.Task] = {}
+
+# Текущее ephemeral-сообщение конкретной команды в конкретном чате:
+# (chat_id, command_key) -> message_id. Обеспечивает правило "одно сообщение
+# на команду одновременно" - если игрок вызывает ту же команду ещё раз, пока
+# предыдущий ответ на неё ещё не пропал (не истёк таймер и не был убран
+# вручную), старое сообщение удаляется перед показом нового, вместо того
+# чтобы копиться рядом с ним. См. replace_command_message / send_command_message.
+_command_messages: dict[tuple[int, str], int] = {}
 
 
 def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = AUTO_DELETE_SECONDS) -> None:
@@ -64,3 +72,42 @@ def cancel_scheduled_delete(chat_id: int, message_id: int) -> None:
     existing = _delete_tasks.pop((chat_id, message_id), None)
     if existing and not existing.done():
         existing.cancel()
+
+
+async def replace_command_message(bot: Bot, chat_id: int, command_key: str) -> None:
+    """
+    Убирает предыдущее ephemeral-сообщение той же команды (command_key) в этом
+    чате, если оно ещё не пропало - см. _command_messages. Вызывается ПЕРЕД
+    отправкой нового ответа на ту же команду, чтобы гарантировать, что одновременно
+    существует не больше одного сообщения на команду.
+    """
+    prev_message_id = _command_messages.pop((chat_id, command_key), None)
+    if prev_message_id is None:
+        return
+    cancel_scheduled_delete(chat_id, prev_message_id)
+    try:
+        await bot.delete_message(chat_id, prev_message_id)
+    except Exception:
+        pass  # уже удалено пользователем/раньше - не критично
+
+
+def track_command_message(
+    bot: Bot, chat_id: int, command_key: str, message_id: int, delay: int = AUTO_DELETE_SECONDS
+) -> None:
+    """Запоминает сообщение как текущее для (chat_id, command_key) и планирует его автоудаление."""
+    _command_messages[(chat_id, command_key)] = message_id
+    schedule_delete(bot, chat_id, message_id, delay)
+
+
+async def send_command_message(
+    bot: Bot, chat_id: int, command_key: str, text: str, delay: int = AUTO_DELETE_SECONDS, **kwargs
+):
+    """
+    Основной способ ответить на команду текстом с соблюдением правила "одно
+    сообщение на команду": убирает предыдущий ответ этой же команды (если он
+    ещё жив), отправляет новый и планирует его автоудаление.
+    """
+    await replace_command_message(bot, chat_id, command_key)
+    sent = await bot.send_message(chat_id, text, **kwargs)
+    track_command_message(bot, chat_id, command_key, sent.message_id, delay)
+    return sent

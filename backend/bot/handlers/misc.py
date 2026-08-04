@@ -1,10 +1,10 @@
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
 from bot import profile
 from bot.database import db
-from bot.utils import schedule_delete
+from bot.utils import send_command_message
 
 router = Router(name="misc")
 
@@ -27,10 +27,10 @@ async def on_pin_service_message(message: Message):
 
 
 @router.message(Command("profile"))
-async def cmd_profile(message: Message):
+async def cmd_profile(message: Message, bot: Bot):
     user = await db.get_user(message.from_user.id)
     if not user or user["reg_state"] != "done":
-        await message.answer("Ты ещё не зарегистрирован. Отправь /start.")
+        await send_command_message(bot, message.chat.id, "profile", "Сначала пройди регистрацию: /start")
         return
 
     # /profile - явный запрос пользователя, поэтому гарантируем видимость: пересоздаём
@@ -40,8 +40,9 @@ async def cmd_profile(message: Message):
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message):
-    sent = await message.answer(
+async def cmd_help(message: Message, bot: Bot):
+    await send_command_message(
+        bot, message.chat.id, "help",
         "/start — регистрация\n"
         "/profile — обновить и показать закреплённую сводку профиля\n"
         "/change_time — сменить время ежедневного испытания\n"
@@ -52,7 +53,6 @@ async def cmd_help(message: Message):
         "/bind_group — привязать текущую группу (вызывать внутри группы)\n"
         "/group_id — узнать ID текущей группы"
     )
-    schedule_delete(message.bot, sent.chat.id, sent.message_id)
 
 
 @router.message(F.chat.type == "private")

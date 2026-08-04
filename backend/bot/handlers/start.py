@@ -9,6 +9,7 @@ from bot import profile
 from bot.config import FOCUS_OPTIONS, time_of_day_label
 from bot.database import db
 from bot.registration import finish_registration
+from bot.utils import send_command_message
 
 router = Router(name="start")
 
@@ -77,7 +78,7 @@ async def cmd_start(message: Message, bot: Bot):
 async def cmd_change_time(message: Message, bot: Bot):
     user = await db.get_user(message.from_user.id)
     if not user or user["reg_state"] != "done":
-        await message.answer("Сначала пройди регистрацию: /start")
+        await send_command_message(bot, message.chat.id, "change_time", "Сначала пройди регистрацию: /start")
         return
 
     text = "Во сколько присылать ежедневное испытание?"
@@ -88,7 +89,7 @@ async def cmd_change_time(message: Message, bot: Bot):
 async def cmd_change_focus(message: Message, bot: Bot):
     user = await db.get_user(message.from_user.id)
     if not user or user["reg_state"] != "done":
-        await message.answer("Сначала пройди регистрацию: /start")
+        await send_command_message(bot, message.chat.id, "change_focus", "Сначала пройди регистрацию: /start")
         return
 
     selected = await db.get_focuses(message.from_user.id)

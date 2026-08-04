@@ -77,6 +77,12 @@ async def build_friend_rows(user_id: int) -> list[dict]:
 
 
 def render_list(friend_rows: list[dict], page: int) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Список друзей - это только заголовок + кликабельные кнопки (см.
+    kb.friend_list_kb, где каждая кнопка уже несёт имя и иконку статуса
+    друга). Само сообщение имена не дублирует текстом: один источник правды,
+    и список не расползается, сколько бы друзей ни было.
+    """
     header = "『 Отряд 』"
 
     if not friend_rows:
@@ -87,8 +93,7 @@ def render_list(friend_rows: list[dict], page: int) -> tuple[str, InlineKeyboard
     page = max(0, min(page, total_pages - 1))
     page_rows = friend_rows[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
 
-    text = f"{header}\n\n" + "\n".join(f"{r['name']} {r['icon']}" for r in page_rows)
-    return text, kb.friend_list_kb(page_rows, page, total_pages)
+    return header, kb.friend_list_kb(page_rows, page, total_pages)
 
 
 async def render_brief(friend: dict, viewer_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
