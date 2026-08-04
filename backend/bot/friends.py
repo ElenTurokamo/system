@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardMarkup
 from bot import keyboards as kb
 from bot.config import FOCUS_OPTIONS, level_from_total_xp
 from bot.database import db
-from bot.profile import display_name, ru_days
+from bot.profile import display_name, focus_stat_line, ru_days
 
 # Друзей на одну страницу /friendlist. Стрелочки листания появляются, только
 # когда друзей больше, чем помещается на одну страницу - то есть больше 3.
@@ -100,18 +100,25 @@ async def render_brief(friend: dict, viewer_id: int, page: int) -> tuple[str, In
     level, xp_into_level, xp_needed = level_from_total_xp(friend["xp"])
     streak = friend["streak"]
 
+    # В брифе друга показываем ТОЛЬКО дисциплины, по которым когда-либо был
+    # прогресс (неважно, отслеживает ли друг их прямо сейчас) - см.
+    # Database.get_focus_keys_with_history. В отличие от личного профиля
+    # (bot/profile.py), здесь нет отдельного приоритета для "отслеживается
+    # сейчас": для стороннего наблюдателя важен сам факт прогресса.
+    history_keys = await db.get_focus_keys_with_history(friend["user_id"])
+    progress_keys = [k for k in FOCUS_OPTIONS if k in history_keys]
+    stats = (
+        "\n".join(focus_stat_line(k, friend) for k in progress_keys)
+        if progress_keys
+        else "Пока нет прогресса ни по одной дисциплине."
+    )
+
     text = (
         f"『 {display_name(friend)} 』\n\n"
         f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
         f"🔥 Серия: {streak} {ru_days(streak)}\n"
         f"📋 Испытание сегодня: {await status_label(friend['user_id'])}\n\n"
-        f"{FOCUS_OPTIONS['pushups']['label']}: {friend['daily_pushups']}\n"
-        f"{FOCUS_OPTIONS['squats']['label']}: {friend['daily_squats']}\n"
-        f"{FOCUS_OPTIONS['abs']['label']}: {friend['daily_abs']}\n"
-        f"{FOCUS_OPTIONS['pullups']['label']}: {friend['daily_pullups']}\n"
-        f"{FOCUS_OPTIONS['running']['label']} (мин): {friend['daily_running']}\n"
-        f"{FOCUS_OPTIONS['chess']['label']} (партий): {friend['daily_chess']}\n"
-        f"{FOCUS_OPTIONS['reading']['label']} (страниц): {friend['daily_reading']}"
+        f"{stats}"
     )
 
     # Поддержать можно только активное (awaiting_action) испытание друга - если

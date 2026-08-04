@@ -107,8 +107,12 @@ async def on_time_chosen(call: CallbackQuery, bot: Bot):
     await db.set_time_of_day(call.from_user.id, time_key)
 
     if user and user["reg_state"] == "done":
-        # Это смена настроек командой /change_time, а не первичная регистрация
+        # Это смена настроек командой /change_time, а не первичная регистрация.
+        # Профиль пересобирается сразу же (editing на месте), т.к. строка
+        # "Время испытаний" в нём должна отражать актуальное значение, не
+        # дожидаясь следующего автоматического обновления профиля.
         await _close_step(bot, call.from_user.id)
+        await profile.sync_profile_message(bot, call.from_user.id)
         await call.answer(f"Время обновлено: {time_of_day_label(time_key)} ✅")
         return
 
@@ -140,8 +144,12 @@ async def on_focus_done(call: CallbackQuery, bot: Bot):
 
     user = await db.get_user(call.from_user.id)
     if user and user["reg_state"] == "done":
-        # Это смена настроек командой /change_focus, а не первичная регистрация
+        # Это смена настроек командой /change_focus, а не первичная регистрация.
+        # Профиль перерисовывается сразу же: новая/снятая дисциплина должна
+        # появиться или уйти из списка "первого приоритета" в тот же момент,
+        # а не после следующего автоматического обновления.
         await _close_step(bot, call.from_user.id)
+        await profile.sync_profile_message(bot, call.from_user.id)
         await call.answer("Дисциплины обновлены ✅")
         return
 

@@ -5,6 +5,7 @@
 регистрации) и затем просто редактируется — при завершении испытания,
 при просрочке, при повторной привязке группы и т.п. Никакого мусора в чате.
 """
+import json
 import logging
 from datetime import datetime
 
@@ -92,7 +93,34 @@ def display_name(user: dict) -> str:
     return user.get("first_name") or user.get("username") or f"Игрок {user['user_id']}"
 
 
-def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claimed_today: bool = False) -> str:
+def get_tracked_focus_keys(user: dict) -> set[str]:
+    """Дисциплины, которые игрок сейчас отслеживает (поле users.focuses)."""
+    raw = user.get("focuses")
+    if not raw:
+        return set()
+    try:
+        return set(json.loads(raw))
+    except (TypeError, ValueError):
+        return set()
+
+
+def focus_stat_line(focus_key: str, user: dict) -> str:
+    """
+    Одна строка статистики по дисциплине - вынесено отдельно, чтобы бриф
+    друга (bot/friends.py) форматировал числа ТОЧНО так же, как личный
+    профиль, вместо дублирования f-строк в двух местах.
+    """
+    opt = FOCUS_OPTIONS[focus_key]
+    unit_suffix = f" ({opt['unit']})" if opt["unit"] != "раз" else ""
+    return f"{opt['label']}{unit_suffix}: {user[opt['counter_field']]}"
+
+
+def render_profile_text(
+    user: dict,
+    quest_done_today: bool = False,
+    bonus_claimed_today: bool = False,
+    history_focus_keys: set[str] | None = None,
+) -> str:
     level, xp_into_level, xp_needed = level_from_total_xp(user["xp"])
     time_label = time_of_day_label(user["time_of_day"]) if user["time_of_day"] else "—"
     group_line = "да ✅" if user["group_id"] else "нет (напиши /bind_group в группе)"
@@ -107,14 +135,24 @@ def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claime
         f"👥 Группа привязана: {group_line}"
     )
 
+    # Дисциплины в профиле показываются в два приоритета (см. описание задачи):
+    # Показываем только "нужные" дисциплины: 1) отслеживаемые сейчас (всегда,
+    # даже с 0) и 2) не отслеживаемые сейчас, но с историей прогресса (см.
+    # Database.get_focus_keys_with_history). Порядок при этом НЕ группируется
+    # по приоритету - используется естественный порядок FOCUS_OPTIONS
+    # (сначала физические дисциплины, потом интеллектуальные), как и было
+    # раньше в профиле. Дисциплины без отслеживания и без единой активности
+    # не показываются вовсе.
+    tracked_keys = get_tracked_focus_keys(user)
+    history_keys = set(history_focus_keys or ())
+    visible_keys = [k for k in FOCUS_OPTIONS if k in tracked_keys or k in history_keys]
+
+    stat_lines: list[str] = [focus_stat_line(k, user) for k in visible_keys]
+
     stats = (
-        f"{FOCUS_OPTIONS['pushups']['label']}: {user['daily_pushups']}\n"
-        f"{FOCUS_OPTIONS['squats']['label']}: {user['daily_squats']}\n"
-        f"{FOCUS_OPTIONS['abs']['label']}: {user['daily_abs']}\n"
-        f"{FOCUS_OPTIONS['pullups']['label']}: {user['daily_pullups']}\n"
-        f"{FOCUS_OPTIONS['running']['label']} (мин): {user['daily_running']}\n"
-        f"{FOCUS_OPTIONS['chess']['label']} (партий): {user['daily_chess']}\n"
-        f"{FOCUS_OPTIONS['reading']['label']} (страниц): {user['daily_reading']}"
+        "\n".join(stat_lines)
+        if stat_lines
+        else "Пока нет отслеживаемых дисциплин - выбери их через /change_focus."
     )
 
     text = f"{header}\n\n{stats}"
@@ -174,7 +212,8 @@ async def sync_profile_message(bot: Bot, user_id: int):
         latest_challenge and latest_challenge["status"] in ("completed", "completed_with_photo")
     )
     bonus_claimed_today = bool(quest_done_today and latest_challenge.get("bonus_claimed"))
-    text = render_profile_text(user, quest_done_today, bonus_claimed_today)
+    history_focus_keys = await db.get_focus_keys_with_history(user_id)
+    text = render_profile_text(user, quest_done_today, bonus_claimed_today, history_focus_keys)
 
     if user.get("profile_message_id"):
         try:
@@ -218,7 +257,8 @@ async def resend_profile_message(bot: Bot, user_id: int):
         latest_challenge and latest_challenge["status"] in ("completed", "completed_with_photo")
     )
     bonus_claimed_today = bool(quest_done_today and latest_challenge.get("bonus_claimed"))
-    text = render_profile_text(user, quest_done_today, bonus_claimed_today)
+    history_focus_keys = await db.get_focus_keys_with_history(user_id)
+    text = render_profile_text(user, quest_done_today, bonus_claimed_today, history_focus_keys)
 
     if user.get("profile_message_id"):
         try:

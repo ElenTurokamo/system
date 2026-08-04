@@ -273,6 +273,39 @@ class Database:
         )
         await self._conn.commit()
 
+    async def get_focus_keys_with_history(self, user_id: int) -> set[str]:
+        """
+        Ключи дисциплин (из FOCUS_OPTIONS), по которым у игрока КОГДА-ЛИБО была
+        зафиксирована активность - либо в истории daily_stats (закрытые дни),
+        либо прямо сейчас в текущих daily_* счётчиках (день ещё не закрыт, но
+        игрок уже что-то отметил). Используется в профиле/брифе друга, чтобы
+        не отслеживаемая сейчас дисциплина не пропадала бесследно, если по ней
+        когда-то был прогресс - см. bot/profile.py и bot/friends.py.
+        """
+        cur = await self._conn.execute(
+            """SELECT
+                   COALESCE(SUM(pushups), 0) AS pushups,
+                   COALESCE(SUM(squats), 0) AS squats,
+                   COALESCE(SUM(abs), 0) AS abs,
+                   COALESCE(SUM(pullups), 0) AS pullups,
+                   COALESCE(SUM(running), 0) AS running,
+                   COALESCE(SUM(chess), 0) AS chess,
+                   COALESCE(SUM(reading), 0) AS reading
+               FROM daily_stats WHERE user_id = ?""",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        history_totals = dict(row) if row else {}
+
+        user = await self.get_user(user_id)
+        active: set[str] = set()
+        for focus_key, opt in FOCUS_OPTIONS.items():
+            history_total = history_totals.get(focus_key) or 0
+            today_amount = (user or {}).get(opt["counter_field"]) or 0
+            if history_total > 0 or today_amount > 0:
+                active.add(focus_key)
+        return active
+
     async def get_users_by_time(self, time_of_day: str) -> list[dict]:
         cur = await self._conn.execute(
             "SELECT * FROM users WHERE time_of_day = ? AND reg_state = 'done'", (time_of_day,)
