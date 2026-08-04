@@ -111,6 +111,8 @@ def render_profile_text(user: dict, quest_done_today: bool = False, bonus_claime
         f"{FOCUS_OPTIONS['pushups']['label']}: {user['daily_pushups']}\n"
         f"{FOCUS_OPTIONS['squats']['label']}: {user['daily_squats']}\n"
         f"{FOCUS_OPTIONS['abs']['label']}: {user['daily_abs']}\n"
+        f"{FOCUS_OPTIONS['pullups']['label']}: {user['daily_pullups']}\n"
+        f"{FOCUS_OPTIONS['running']['label']} (мин): {user['daily_running']}\n"
         f"{FOCUS_OPTIONS['chess']['label']} (партий): {user['daily_chess']}\n"
         f"{FOCUS_OPTIONS['reading']['label']} (страниц): {user['daily_reading']}"
     )

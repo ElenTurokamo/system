@@ -108,6 +108,8 @@ async def render_brief(friend: dict, viewer_id: int, page: int) -> tuple[str, In
         f"{FOCUS_OPTIONS['pushups']['label']}: {friend['daily_pushups']}\n"
         f"{FOCUS_OPTIONS['squats']['label']}: {friend['daily_squats']}\n"
         f"{FOCUS_OPTIONS['abs']['label']}: {friend['daily_abs']}\n"
+        f"{FOCUS_OPTIONS['pullups']['label']}: {friend['daily_pullups']}\n"
+        f"{FOCUS_OPTIONS['running']['label']} (мин): {friend['daily_running']}\n"
         f"{FOCUS_OPTIONS['chess']['label']} (партий): {friend['daily_chess']}\n"
         f"{FOCUS_OPTIONS['reading']['label']} (страниц): {friend['daily_reading']}"
     )

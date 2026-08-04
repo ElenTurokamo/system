@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS users (
     daily_pushups   INTEGER DEFAULT 0,
     daily_squats    INTEGER DEFAULT 0,
     daily_abs       INTEGER DEFAULT 0,
+    daily_pullups   INTEGER DEFAULT 0,
+    daily_running   INTEGER DEFAULT 0,
     daily_chess     INTEGER DEFAULT 0,
     daily_reading   INTEGER DEFAULT 0,
     reg_state       TEXT DEFAULT 'done', -- FSM-состояние регистрации
@@ -75,6 +77,8 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     pushups         INTEGER DEFAULT 0,
     squats          INTEGER DEFAULT 0,
     abs             INTEGER DEFAULT 0,
+    pullups         INTEGER DEFAULT 0,
+    running         INTEGER DEFAULT 0,
     chess           INTEGER DEFAULT 0,
     reading         INTEGER DEFAULT 0,
     challenge_id    INTEGER,
@@ -138,6 +142,8 @@ class Database:
             "failure_message_id": "INTEGER",
             "awaiting_friend_code": "INTEGER DEFAULT 0",
             "friend_prompt_message_id": "INTEGER",
+            "daily_pullups": "INTEGER DEFAULT 0",
+            "daily_running": "INTEGER DEFAULT 0",
         }
         changed = False
         for name, col_type in new_user_columns.items():
@@ -167,6 +173,17 @@ class Database:
                 "ALTER TABLE challenge_progress ADD COLUMN bonus_claimed INTEGER DEFAULT 0"
             )
             changed = True
+
+        cur = await self._conn.execute("PRAGMA table_info(daily_stats)")
+        existing_daily_stats = {row[1] for row in await cur.fetchall()}
+        new_daily_stats_columns = {
+            "pullups": "INTEGER DEFAULT 0",
+            "running": "INTEGER DEFAULT 0",
+        }
+        for name, col_type in new_daily_stats_columns.items():
+            if name not in existing_daily_stats:
+                await self._conn.execute(f"ALTER TABLE daily_stats ADD COLUMN {name} {col_type}")
+                changed = True
 
         if changed:
             await self._conn.commit()
@@ -590,19 +607,21 @@ class Database:
         except (TypeError, ValueError):
             local_date = datetime.utcnow().date().isoformat()
 
-        amounts = {"pushups": 0, "squats": 0, "abs": 0, "chess": 0, "reading": 0}
+        amounts = {"pushups": 0, "squats": 0, "abs": 0, "pullups": 0, "running": 0, "chess": 0, "reading": 0}
         rows = await self.get_progress_rows(challenge_id)
         for r in rows:
             if r["focus"] in amounts:
                 amounts[r["focus"]] = r["amount"]
 
         await self._conn.execute(
-            """INSERT INTO daily_stats (user_id, date, pushups, squats, abs, chess, reading, challenge_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO daily_stats (user_id, date, pushups, squats, abs, pullups, running, chess, reading, challenge_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id, date) DO UPDATE SET
                    pushups = excluded.pushups,
                    squats = excluded.squats,
                    abs = excluded.abs,
+                   pullups = excluded.pullups,
+                   running = excluded.running,
                    chess = excluded.chess,
                    reading = excluded.reading,
                    challenge_id = excluded.challenge_id""",
@@ -612,6 +631,8 @@ class Database:
                 amounts["pushups"],
                 amounts["squats"],
                 amounts["abs"],
+                amounts["pullups"],
+                amounts["running"],
                 amounts["chess"],
                 amounts["reading"],
                 challenge_id,
