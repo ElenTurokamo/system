@@ -227,6 +227,32 @@ async def on_flist_open(call: CallbackQuery, bot: Bot):
     await call.answer()
 
 
+@router.callback_query(F.data.startswith("flist:remove:"))
+async def on_flist_remove(call: CallbackQuery, bot: Bot):
+    """
+    Удаление друга из "Отряда". Без подтверждения (нажатие сразу удаляет) и
+    БЕЗ каких-либо уведомлений в чат - ни тому, кто удалил, ни удалённому:
+    только тихое обновление списка у инициатора. Дружба двусторонняя (см.
+    Database.get_friend_ids), поэтому удаляется единственная строка в
+    friendships независимо от того, кто изначально отправлял заявку.
+    """
+    _, _, friend_id, page = call.data.split(":")
+    friend_id, page = int(friend_id), int(page)
+
+    friendship = await db.find_friendship(call.from_user.id, friend_id)
+    if friendship and friendship["status"] == "accepted":
+        await db.delete_friendship(friendship["id"])
+
+    friend_rows = await friends.build_friend_rows(call.from_user.id)
+    text, markup = friends.render_list(friend_rows, page)
+    try:
+        await call.message.edit_text(text, reply_markup=markup)
+    except Exception:
+        pass
+    schedule_delete(bot, call.message.chat.id, call.message.message_id)
+    await call.answer()
+
+
 @router.callback_query(F.data.startswith("flist:cheer:"))
 async def on_flist_cheer(call: CallbackQuery, bot: Bot):
     _, _, friend_id, page = call.data.split(":")

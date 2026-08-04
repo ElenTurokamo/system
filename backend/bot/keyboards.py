@@ -124,5 +124,8 @@ def friend_brief_kb(
         rows.append(
             [InlineKeyboardButton(text=label, callback_data=f"flist:cheer:{friend_user_id}:{page}")]
         )
+    rows.append(
+        [InlineKeyboardButton(text="🗑 Удалить из отряда", callback_data=f"flist:remove:{friend_user_id}:{page}")]
+    )
     rows.append([InlineKeyboardButton(text="⬅ Назад", callback_data=f"flist:page:{page}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

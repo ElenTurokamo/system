@@ -116,7 +116,7 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
         if cheer_line:
             text += f"\n\n{cheer_line}"
 
-        text += f"\n\n{DIVIDER}\n{_format_time_left(challenge)}"
+        text += f"\n{DIVIDER}\n{_format_time_left(challenge)}"
         return text
 
     lines: list[str] = []
