@@ -234,10 +234,10 @@ async def send_challenge_message(bot: Bot, challenge_id: int):
     Отправляет актуальное состояние испытания НОВЫМ сообщением и записывает его
     message_id как точку правды, по которой дальше работает push_challenge_update.
 
-    Используется как при первичной отправке испытания дня (диспетчер), так и при
-    пересылке, если старое сообщение недоступно пользователю (например, он
-    очистил историю чата) - иначе push_challenge_update продолжал бы молча
-    редактировать сообщение, которое пользователь уже не видит.
+    Используется при первичной отправке испытания дня (диспетчер) - в этот
+    момент предыдущего сообщения по определению нет, удалять нечего. Для
+    случаев, когда карточка уже могла существовать (см. resend_challenge_message
+    ниже), используй именно её - иначе получится дубликат в чате.
     """
     challenge = await db.get_challenge(challenge_id)
     if not challenge:
@@ -251,6 +251,26 @@ async def send_challenge_message(bot: Bot, challenge_id: int):
     await db.set_message_id(challenge_id, msg.message_id)
 
 
-# Псевдоним для читаемости на месте вызова (см. handlers/start.py) - смысл действия
-# там именно "переслать снова", хотя механика идентична первичной отправке.
-resend_challenge_message = send_challenge_message
+async def resend_challenge_message(bot: Bot, challenge_id: int):
+    """
+    Принудительно ПЕРЕсоздаёт карточку испытания: сначала удаляет предыдущее
+    сообщение (если оно есть - удаление просто игнорируется, если сообщение
+    уже недоступно), затем отправляет новое как send_challenge_message.
+
+    В отличие от send_challenge_message, здесь мы НЕ предполагаем, что
+    предыдущего сообщения не существует - используется там, где карточка
+    могла уже быть отправлена ранее (например, /start у игрока с активным
+    испытанием, см. handlers/start.py). Без явного удаления здесь оставался
+    бы дубликат: старая карточка продолжала бы висеть в чате рядом с новой.
+    """
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge:
+        return
+
+    if challenge.get("message_id"):
+        try:
+            await bot.delete_message(challenge["user_id"], challenge["message_id"])
+        except Exception as e:
+            logger.info("Не удалось удалить предыдущую карточку испытания %s: %s", challenge_id, e)
+
+    await send_challenge_message(bot, challenge_id)

@@ -63,7 +63,7 @@ async def cmd_start(message: Message, bot: Bot):
 
         active_challenge = await db.get_active_challenge(message.from_user.id)
         if active_challenge:
-            await challenge_render.send_challenge_message(bot, active_challenge["id"])
+            await challenge_render.resend_challenge_message(bot, active_challenge["id"])
         return
 
     text = (
