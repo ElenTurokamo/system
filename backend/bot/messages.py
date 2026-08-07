@@ -125,12 +125,49 @@ def photo_caption(streak: int, user_id: int, physical_bonus_claimed: bool = Fals
     return text
 
 
-def give_up(xp_loss: int = 0, penalty_hours: int = 0) -> str:
-    return _compose("give_up", xp_loss=xp_loss, penalty_hours=penalty_hours)
+_FAILURE_REASON_LINES = {
+    "timeout": "Дневной квест не был выполнен в отведённое время.",
+    "gave_up": "Игрок добровольно отказался от дневного квеста.",
+}
 
 
-def expired(xp_loss: int = 0, penalty_hours: int = 0) -> str:
-    return _compose("expired", xp_loss=xp_loss, penalty_hours=penalty_hours)
+def challenge_failed(reason: str, xp_loss: int = 0, penalty_hours: int = 0) -> str:
+    """
+    Отдельная карточка-уведомление о провале дневного квеста - оформлена как
+    системное окно (рамка + фиксированная структура: статус / причина / кара),
+    в духе интерфейса Системы из Solo Leveling. Текст не заимствован из
+    оригинала (это нарушало бы авторские права) - только стилистика: холодный,
+    безличный тон, формулировки в стиле игрового лога, разбивка на статус и
+    последствия.
+
+    В отличие от большинства других сообщений бота, текст здесь ФИКСИРОВАН
+    (без банка случайных фраз, как и challenge_start/photo_caption) - это
+    официальное уведомление Системы, и ему не пристало звучать по-разному
+    от раза к разу.
+
+    reason: "timeout" (испытание сгорело по таймауту) или "gave_up" (игрок
+    сдался сам) - меняется только строка причины, остальная карточка едина
+    для обоих случаев провала.
+
+    Само сообщение автоматически удаляется через settings.failure_message_ttl_minutes
+    после отправки (см. scheduler.cleanup_failure_messages), а также раньше -
+    как только выдан новый ежедневный квест (см. profile.clear_failure_message).
+    """
+    reason_line = _FAILURE_REASON_LINES.get(reason, "Дневной квест провален.")
+    return (
+        "⚠ 『 Уведомление Системы 』 ⚠\n"
+        "──────────────────\n"
+        "Статус квеста: ПРОВАЛЕН\n"
+        f"{reason_line}\n"
+        "──────────────────\n"
+        "Наложена кара:\n"
+        f"▸ Опыт: −{xp_loss} XP\n"
+        "▸ Серия дней: обнулена\n"
+        f"▸ Ограничение доступа: {penalty_hours} ч\n"
+        "──────────────────\n"
+        "Система не делает исключений для слабых.\n"
+        "Новый шанс появится вместе со следующим испытанием."
+    )
 
 
 def level_up(level: int) -> str:

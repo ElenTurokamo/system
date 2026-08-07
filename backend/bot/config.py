@@ -30,6 +30,27 @@ class Settings:
         default_factory=lambda: int(_env("MISSED_DAY_XP_PENALTY", "300"))
     )
 
+    # Telegram Bot API перестаёт разрешать editMessageText для сообщения по
+    # достижении этого возраста (де-факто ограничение платформы, ~48 часов).
+    # Профиль - единственное сообщение бота, которое живёт неограниченно долго
+    # и постоянно редактируется на месте, поэтому именно ему грозит эта
+    # проблема (см. scheduler.refresh_stale_profiles / profile.py).
+    profile_edit_window_hours: int = field(
+        default_factory=lambda: int(_env("PROFILE_EDIT_WINDOW_HOURS", "48"))
+    )
+    # Насколько раньше окончания окна редактирования профиль пересоздаётся
+    # превентивно (удаление + новое сообщение + закрепление), чтобы игрок
+    # никогда не увидел ошибку редактирования или "залипший" старый профиль.
+    profile_refresh_buffer_hours: int = field(
+        default_factory=lambda: int(_env("PROFILE_REFRESH_BUFFER_HOURS", "2"))
+    )
+    # Через сколько минут после отправки автоматически удаляется пуш-уведомление
+    # о провале испытания (см. scheduler.cleanup_failure_messages), чтобы оно не
+    # копилось в чате даже если игрок не откроет бота до следующего дня.
+    failure_message_ttl_minutes: int = field(
+        default_factory=lambda: int(_env("FAILURE_MESSAGE_TTL_MINUTES", "60"))
+    )
+
     # ---------- Автобэкап БД в приватный GitHub-репозиторий ----------
     # Если BACKUP_REPO_URL пустой - автобэкап просто не регистрируется в
     # планировщике (см. scheduler.setup_scheduler), никакой ошибки не будет.

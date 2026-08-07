@@ -204,7 +204,9 @@ async def on_give_up(call: CallbackQuery):
     await challenge_render.close_failed_challenge(
         call.bot,
         challenge_id,
-        tx.give_up(xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours),
+        tx.challenge_failed(
+            "gave_up", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
+        ),
     )
     await profile.sync_profile_message(call.bot, call.from_user.id)
     await call.answer()

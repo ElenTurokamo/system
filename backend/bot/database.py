@@ -138,8 +138,10 @@ class Database:
             "last_reg_message_id": "INTEGER",
             "profile_chat_id": "INTEGER",
             "profile_message_id": "INTEGER",
+            "profile_created_at": "TEXT",  # когда текущее сообщение профиля было отправлено (см. refresh_stale_profiles)
             "failure_chat_id": "INTEGER",
             "failure_message_id": "INTEGER",
+            "failure_sent_at": "TEXT",  # когда ушёл текущий пуш о провале (см. cleanup_failure_messages)
             "awaiting_friend_code": "INTEGER DEFAULT 0",
             "friend_prompt_message_id": "INTEGER",
             "daily_pullups": "INTEGER DEFAULT 0",
@@ -254,24 +256,64 @@ class Database:
 
     async def set_profile_message(self, user_id: int, chat_id: int, message_id: int):
         await self._conn.execute(
-            "UPDATE users SET profile_chat_id = ?, profile_message_id = ? WHERE user_id = ?",
-            (chat_id, message_id, user_id),
+            "UPDATE users SET profile_chat_id = ?, profile_message_id = ?, profile_created_at = ? "
+            "WHERE user_id = ?",
+            (chat_id, message_id, datetime.utcnow().isoformat(), user_id),
         )
         await self._conn.commit()
 
     async def set_failure_message(self, user_id: int, chat_id: int, message_id: int):
         await self._conn.execute(
-            "UPDATE users SET failure_chat_id = ?, failure_message_id = ? WHERE user_id = ?",
-            (chat_id, message_id, user_id),
+            "UPDATE users SET failure_chat_id = ?, failure_message_id = ?, failure_sent_at = ? "
+            "WHERE user_id = ?",
+            (chat_id, message_id, datetime.utcnow().isoformat(), user_id),
         )
         await self._conn.commit()
 
     async def clear_failure_message(self, user_id: int):
         await self._conn.execute(
-            "UPDATE users SET failure_chat_id = NULL, failure_message_id = NULL WHERE user_id = ?",
+            "UPDATE users SET failure_chat_id = NULL, failure_message_id = NULL, failure_sent_at = NULL "
+            "WHERE user_id = ?",
             (user_id,),
         )
         await self._conn.commit()
+
+    async def get_users_with_stale_profile(self, edit_window_hours: int, buffer_hours: int) -> list[dict]:
+        """
+        Пользователи, чьё текущее сообщение профиля приближается к границе, после
+        которой Telegram Bot API перестаёт разрешать его редактирование (см.
+        settings.profile_edit_window_hours) - т.е. сообщению уже >= (edit_window_hours
+        - buffer_hours) часов. Используется планировщиком, чтобы пересоздать профиль
+        ЗАРАНЕЕ (см. scheduler.refresh_stale_profiles), а не когда editMessageText
+        уже начнёт падать по ошибке.
+        """
+        cutoff = (
+            datetime.utcnow() - timedelta(hours=edit_window_hours - buffer_hours)
+        ).isoformat()
+        cur = await self._conn.execute(
+            "SELECT * FROM users WHERE profile_message_id IS NOT NULL "
+            "AND profile_created_at IS NOT NULL AND profile_created_at <= ?",
+            (cutoff,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_users_with_expired_failure_message(self, ttl_minutes: int) -> list[dict]:
+        """
+        Пользователи, у которых пуш-уведомление о провале испытания висит уже
+        дольше settings.failure_message_ttl_minutes - его пора удалить, чтобы
+        чат оставался чистым (см. scheduler.cleanup_failure_messages). Отдельно
+        от profile.clear_failure_message, которая удаляет его же, но раньше -
+        как только выдан новый ежедневный квест.
+        """
+        cutoff = (datetime.utcnow() - timedelta(minutes=ttl_minutes)).isoformat()
+        cur = await self._conn.execute(
+            "SELECT * FROM users WHERE failure_message_id IS NOT NULL "
+            "AND failure_sent_at IS NOT NULL AND failure_sent_at <= ?",
+            (cutoff,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def get_focus_keys_with_history(self, user_id: int) -> set[str]:
         """

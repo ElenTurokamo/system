@@ -38,14 +38,16 @@ async def dispatch_daily_challenges(bot: Bot, time_of_day: str):
         )
         challenge_id = await db.create_challenge(user["user_id"], quest_text, focuses)
 
+        # Профиль обновляется ПЕРЕД отправкой карточки испытания, а не после -
+        # так в чате профиль всегда оказывается выше нового квеста, а не
+        # наоборот (испытание создано в БД строкой выше, поэтому отметка
+        # "Вы выполнили сегодняшний квест" в профиле уже корректно исчезает).
+        await profile.sync_profile_message(bot, user["user_id"])
+
         try:
             await challenge_render.send_challenge_message(bot, challenge_id)
         except Exception as e:
             logger.warning("Не удалось отправить испытание пользователю %s: %s", user["user_id"], e)
-
-        # Новое испытание создано (status снова awaiting_action) - отметка
-        # "Вы выполнили сегодняшний квест" в профиле должна исчезнуть сама.
-        await profile.sync_profile_message(bot, user["user_id"])
 
 
 async def expire_stale_challenges(bot: Bot):
@@ -67,7 +69,9 @@ async def expire_stale_challenges(bot: Bot):
         await challenge_render.close_failed_challenge(
             bot,
             challenge["id"],
-            tx.expired(xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours),
+            tx.challenge_failed(
+                "timeout", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
+            ),
         )
 
         await profile.sync_profile_message(bot, user_id)
@@ -82,6 +86,38 @@ async def refresh_challenge_timers(bot: Bot):
     challenges = await db.get_awaiting_challenges()
     for challenge in challenges:
         await challenge_render.push_challenge_update(bot, challenge["id"])
+
+
+async def refresh_stale_profiles(bot: Bot):
+    """
+    Превентивно пересоздаёт сообщение профиля, если оно приближается к
+    границе, после которой Telegram Bot API перестаёт разрешать его
+    редактирование (см. settings.profile_edit_window_hours/profile_refresh_buffer_hours).
+
+    Без этого sync_profile_message продолжал бы молча editMessageText, пока
+    Telegram не начнёт отвечать ошибкой - и только тогда (реактивно, с
+    заметной задержкой до следующего апдейта) пересоздал бы сообщение. Здесь
+    же пересоздание происходит заранее и планово, так что игрок никогда не
+    видит ни ошибки, ни "залипший" старый профиль.
+    """
+    users = await db.get_users_with_stale_profile(
+        settings.profile_edit_window_hours, settings.profile_refresh_buffer_hours
+    )
+    for user in users:
+        await profile.resend_profile_message(bot, user["user_id"])
+
+
+async def cleanup_failure_messages(bot: Bot):
+    """
+    Удаляет пуш-уведомления о провале испытания, которые висят в чате уже
+    дольше settings.failure_message_ttl_minutes (по умолчанию - час), чтобы
+    чат оставался чистым, даже если игрок не откроет бота до выдачи
+    следующего ежедневного квеста (при котором это сообщение тоже удаляется -
+    см. profile.clear_failure_message).
+    """
+    users = await db.get_users_with_expired_failure_message(settings.failure_message_ttl_minutes)
+    for user in users:
+        await profile.clear_failure_message(bot, user)
 
 
 async def refresh_penalty_profiles(bot: Bot):
@@ -115,6 +151,29 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         minutes=15,
         args=[bot],
         id="expire_check",
+        replace_existing=True,
+    )
+
+    # Превентивное пересоздание "постаревшего" сообщения профиля, пока Telegram
+    # ещё разрешает его отредактировать в последний раз (см. docstring выше) -
+    # раз в 30 минут этого достаточно с запасом (buffer по умолчанию - 2 часа).
+    scheduler.add_job(
+        refresh_stale_profiles,
+        "interval",
+        minutes=30,
+        args=[bot],
+        id="profile_freshness_check",
+        replace_existing=True,
+    )
+
+    # Удаление пуш-уведомлений о провале испытания через час после отправки -
+    # раз в 5 минут, чтобы сообщение не задерживалось в чате надолго сверх TTL.
+    scheduler.add_job(
+        cleanup_failure_messages,
+        "interval",
+        minutes=5,
+        args=[bot],
+        id="failure_message_cleanup",
         replace_existing=True,
     )
 
