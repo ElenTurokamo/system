@@ -42,7 +42,12 @@ async def dispatch_daily_challenges(bot: Bot, time_of_day: str):
         # так в чате профиль всегда оказывается выше нового квеста, а не
         # наоборот (испытание создано в БД строкой выше, поэтому отметка
         # "Вы выполнили сегодняшний квест" в профиле уже корректно исчезает).
-        await profile.sync_profile_message(bot, user["user_id"])
+        #
+        # Именно здесь (а не отдельной фоновой джобой) профиль ещё и
+        # ПЕРЕСОЗДАЁТСЯ, если это нужно (см. profile.ensure_fresh_profile_message) -
+        # так пересоздание не может случиться чаще раза в день и происходит
+        # только в момент выдачи квеста, во время, которое сам игрок задал.
+        await profile.ensure_fresh_profile_message(bot, user["user_id"])
 
         try:
             await challenge_render.send_challenge_message(bot, challenge_id)
@@ -86,25 +91,6 @@ async def refresh_challenge_timers(bot: Bot):
     challenges = await db.get_awaiting_challenges()
     for challenge in challenges:
         await challenge_render.push_challenge_update(bot, challenge["id"])
-
-
-async def refresh_stale_profiles(bot: Bot):
-    """
-    Превентивно пересоздаёт сообщение профиля, если оно приближается к
-    границе, после которой Telegram Bot API перестаёт разрешать его
-    редактирование (см. settings.profile_edit_window_hours/profile_refresh_buffer_hours).
-
-    Без этого sync_profile_message продолжал бы молча editMessageText, пока
-    Telegram не начнёт отвечать ошибкой - и только тогда (реактивно, с
-    заметной задержкой до следующего апдейта) пересоздал бы сообщение. Здесь
-    же пересоздание происходит заранее и планово, так что игрок никогда не
-    видит ни ошибки, ни "залипший" старый профиль.
-    """
-    users = await db.get_users_with_stale_profile(
-        settings.profile_edit_window_hours, settings.profile_refresh_buffer_hours
-    )
-    for user in users:
-        await profile.resend_profile_message(bot, user["user_id"])
 
 
 async def cleanup_failure_messages(bot: Bot):
@@ -154,17 +140,12 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # Превентивное пересоздание "постаревшего" сообщения профиля, пока Telegram
-    # ещё разрешает его отредактировать в последний раз (см. docstring выше) -
-    # раз в 30 минут этого достаточно с запасом (buffer по умолчанию - 2 часа).
-    scheduler.add_job(
-        refresh_stale_profiles,
-        "interval",
-        minutes=30,
-        args=[bot],
-        id="profile_freshness_check",
-        replace_existing=True,
-    )
+    # Превентивное пересоздание "постаревшего" сообщения профиля (пока Telegram
+    # ещё разрешает его отредактировать в последний раз) теперь НЕ отдельная
+    # фоновая джоба, а часть dispatch_daily_challenges (см. её docstring выше и
+    # profile.ensure_fresh_profile_message) - так пересоздание происходит не
+    # чаще раза в день и всегда в момент выдачи ежедневного квеста, в то время,
+    # которое сам игрок задал, а не в случайный момент отдельного расписания.
 
     # Удаление пуш-уведомлений о провале испытания через час после отправки -
     # раз в 5 минут, чтобы сообщение не задерживалось в чате надолго сверх TTL.

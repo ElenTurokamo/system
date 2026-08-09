@@ -4,10 +4,21 @@
 Идея: одно сообщение в личке с ботом, которое создаётся один раз (в конце
 регистрации) и затем просто редактируется — при завершении испытания,
 при просрочке, при повторной привязке группы и т.п. Никакого мусора в чате.
+
+ВАЖНО про пересоздание сообщения: единственные места, где профиль разрешено
+ПЕРЕСОЗДАТЬ (удалить старое + прислать и закрепить новое), - явная команда
+/profile (см. handlers/misc.py) и ежедневный диспетчер квестов в момент
+выдачи испытания на СВОЙ временной слот игрока (см.
+scheduler.dispatch_daily_challenges -> profile.ensure_fresh_profile_message).
+Все остальные автоматические обновления (sync_profile_message) - только
+edit на месте, без пересоздания, даже если edit не удался. Так пересоздание
+(и связанный с ним пуш) не может случиться чаще раза в день и не может
+случиться в случайный момент от фоновой джобы - только в то время, которое
+сам игрок выбрал для своих испытаний.
 """
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -195,13 +206,44 @@ async def clear_failure_message(bot: Bot, user: dict):
     await db.clear_failure_message(user["user_id"])
 
 
+def _is_profile_stale(user: dict) -> bool:
+    """
+    True, если текущему сообщению профиля уже >= (profile_edit_window_hours -
+    profile_refresh_buffer_hours) часов - т.е. оно приближается к границе,
+    после которой Telegram Bot API перестаёт разрешать editMessageText.
+    Используется ТОЛЬКО диспетчером ежедневных квестов (см.
+    ensure_fresh_profile_message), чтобы решить, пересоздавать профиль в
+    момент выдачи квеста или достаточно обычного edit'а.
+    """
+    created_at = user.get("profile_created_at")
+    if not created_at:
+        return False
+    try:
+        created = datetime.fromisoformat(created_at)
+    except (TypeError, ValueError):
+        return False
+    threshold_hours = settings.profile_edit_window_hours - settings.profile_refresh_buffer_hours
+    return datetime.utcnow() - created >= timedelta(hours=threshold_hours)
+
+
 async def sync_profile_message(bot: Bot, user_id: int):
     """
-    Обновляет закреплённую сводку профиля пользователя.
-    Используется для автоматических обновлений (испытание завершено/просрочено/группа
-    привязана) - лёгкий edit без пересоздания сообщения, чтобы не спамить.
-    Если сообщения ещё нет (первая регистрация) или его удалили НАВСЕГДА (ошибка API) -
-    создаёт новое и закрепляет.
+    Обновляет закреплённую сводку профиля пользователя лёгким edit'ом НА МЕСТЕ.
+    Используется для всех автоматических обновлений (испытание завершено/просрочено/
+    группа привязана, обновление таймера штрафа и т.п.).
+
+    Эта функция НИКОГДА не пересоздаёт сообщение. Если редактирование не удалось
+    (сообщение удалено пользователем, устарело для editMessageText, временная
+    ошибка/flood-control Telegram и т.п.) - ошибка просто логируется, а актуальный
+    текст подтянется при следующем вызове. Пересоздание сообщения (и связанный с
+    ним пуш) - отдельная операция, доступная только через resend_profile_message /
+    ensure_fresh_profile_message (см. их докстринги и докстринг модуля выше);
+    раньше эта функция сама пересоздавала сообщение при ЛЮБОЙ ошибке edit'а
+    (включая временные вроде flood-control), из-за чего в чате копились
+    непогашенные дубликаты профиля с лишними пуш-уведомлениями в случайное
+    время суток - именно это здесь и исправлено.
+
+    Если сообщения профиля ещё нет вообще (первая регистрация) - создаёт его.
     """
     user = await db.get_user(user_id)
     if not user:
@@ -215,27 +257,55 @@ async def sync_profile_message(bot: Bot, user_id: int):
     history_focus_keys = await db.get_focus_keys_with_history(user_id)
     text = render_profile_text(user, quest_done_today, bonus_claimed_today, history_focus_keys)
 
-    if user.get("profile_message_id"):
-        try:
-            await bot.edit_message_text(
-                text,
-                chat_id=user["profile_chat_id"],
-                message_id=user["profile_message_id"],
-            )
-            return
-        except TelegramBadRequest as e:
-            if "message is not modified" in str(e).lower():
-                # Текст не изменился с прошлого раза - это нормально, ничего не делаем.
-                return
-            logger.info(
-                "Не удалось обновить сводку профиля %s (пересоздаю): %s", user_id, e
-            )
-        except Exception as e:
-            logger.info(
-                "Не удалось обновить сводку профиля %s (пересоздаю): %s", user_id, e
-            )
+    if not user.get("profile_message_id"):
+        # Профиля ещё не существует (первая регистрация) - создаём и закрепляем.
+        await _send_and_pin(bot, user_id, text)
+        return
 
-    await _send_and_pin(bot, user_id, text)
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=user["profile_chat_id"],
+            message_id=user["profile_message_id"],
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            # Текст не изменился с прошлого раза - это нормально, ничего не делаем.
+            return
+        logger.info(
+            "Не удалось обновить сводку профиля %s (НЕ пересоздаю, попробую в "
+            "следующий раз): %s", user_id, e
+        )
+    except Exception as e:
+        logger.info(
+            "Не удалось обновить сводку профиля %s (НЕ пересоздаю, попробую в "
+            "следующий раз): %s", user_id, e
+        )
+
+
+async def ensure_fresh_profile_message(bot: Bot, user_id: int):
+    """
+    Используется ИСКЛЮЧИТЕЛЬНО ежедневным диспетчером квестов
+    (см. scheduler.dispatch_daily_challenges), вызывается один раз в день - в
+    момент выдачи испытания на собственный временной слот игрока.
+
+    Если сообщение профиля приближается к границе, после которой Telegram
+    перестанет давать его редактировать (см. _is_profile_stale) - пересоздаёт
+    его (resend_profile_message). Иначе - обычный лёгкий edit (sync_profile_message).
+
+    Это единственное место (не считая явной команды /profile), где профиль
+    может быть пересоздан автоматически - поэтому пересоздание никогда не
+    происходит чаще раза в день и всегда в то время, которое сам игрок задал
+    для своих испытаний, а не по расписанию отдельной фоновой джобы.
+    """
+    user = await db.get_user(user_id)
+    if not user:
+        return
+
+    if user.get("profile_message_id") and _is_profile_stale(user):
+        await resend_profile_message(bot, user_id)
+    else:
+        await sync_profile_message(bot, user_id)
 
 
 async def resend_profile_message(bot: Bot, user_id: int):
@@ -247,6 +317,11 @@ async def resend_profile_message(bot: Bot, user_id: int):
     пользователь историю чата локально (edit_message_text в этом случае "успешно"
     редактирует невидимое сообщение), поэтому единственный надёжный способ гарантировать
     видимость профиля по явному запросу - переслать его заново.
+
+    Также вызывается диспетчером ежедневных квестов через ensure_fresh_profile_message,
+    когда текущее сообщение профиля приближается к границе редактирования Telegram -
+    это единственные два места, где профиль пересоздаётся автоматически (см. докстринг
+    модуля выше и sync_profile_message).
     """
     user = await db.get_user(user_id)
     if not user:
@@ -271,7 +346,11 @@ async def resend_profile_message(bot: Bot, user_id: int):
 
 async def _send_and_pin(bot: Bot, user_id: int, text: str):
     try:
-        msg = await bot.send_message(user_id, text)
+        # disable_notification=True - (пере)создание сообщения профиля само по себе
+        # не несёт новой информации, достойной пуша (в отличие от карточки квеста);
+        # без этого каждое пересоздание било лишним уведомлением поверх и так уже
+        # отправленного пуша дневного испытания.
+        msg = await bot.send_message(user_id, text, disable_notification=True)
         await db.set_profile_message(user_id, user_id, msg.message_id)
         try:
             await bot.pin_chat_message(user_id, msg.message_id, disable_notification=True)

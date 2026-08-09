@@ -278,26 +278,6 @@ class Database:
         )
         await self._conn.commit()
 
-    async def get_users_with_stale_profile(self, edit_window_hours: int, buffer_hours: int) -> list[dict]:
-        """
-        Пользователи, чьё текущее сообщение профиля приближается к границе, после
-        которой Telegram Bot API перестаёт разрешать его редактирование (см.
-        settings.profile_edit_window_hours) - т.е. сообщению уже >= (edit_window_hours
-        - buffer_hours) часов. Используется планировщиком, чтобы пересоздать профиль
-        ЗАРАНЕЕ (см. scheduler.refresh_stale_profiles), а не когда editMessageText
-        уже начнёт падать по ошибке.
-        """
-        cutoff = (
-            datetime.utcnow() - timedelta(hours=edit_window_hours - buffer_hours)
-        ).isoformat()
-        cur = await self._conn.execute(
-            "SELECT * FROM users WHERE profile_message_id IS NOT NULL "
-            "AND profile_created_at IS NOT NULL AND profile_created_at <= ?",
-            (cutoff,),
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
-
     async def get_users_with_expired_failure_message(self, ttl_minutes: int) -> list[dict]:
         """
         Пользователи, у которых пуш-уведомление о провале испытания висит уже
