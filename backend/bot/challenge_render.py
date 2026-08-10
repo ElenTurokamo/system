@@ -216,7 +216,7 @@ async def push_giveup_confirm(bot: Bot, challenge_id: int):
             "Сдаться?",
             chat_id=challenge["user_id"],
             message_id=challenge["message_id"],
-            reply_markup=kb.confirm_giveup_kb(challenge_id, "card"),
+            reply_markup=kb.confirm_giveup_kb(challenge_id),
         )
     except Exception as e:
         logger.info("Не удалось показать подтверждение сдачи %s: %s", challenge_id, e)

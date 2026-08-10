@@ -9,7 +9,7 @@ from bot import profile
 from bot.config import FOCUS_OPTIONS, time_of_day_label
 from bot.database import db
 from bot.registration import finish_registration
-from bot.utils import send_command_message
+from bot.utils import cancel_scheduled_delete, send_command_message
 
 router = Router(name="start")
 
@@ -54,6 +54,14 @@ async def cmd_start(message: Message, bot: Bot):
     )
 
     if user["reg_state"] == "done":
+        # Явный повторный /start - помимо обычного показа профиля/испытания,
+        # это ещё и штатный способ снять остановку Системы, поставленную
+        # командой /stop (см. cmd_stop ниже) - другого способа возобновить
+        # рассылку ежедневных испытаний у игрока нет.
+        resumed = bool(user.get("is_stopped"))
+        if resumed:
+            await db.set_stopped(message.from_user.id, False)
+
         # Никаких информационных сообщений - только сама суть: закреплённый профиль
         # и (если сегодняшнее испытание ещё не завершено) трекер испытания дня.
         # Оба пересылаются новым сообщением, а не редактируются на месте, т.к. /start -
@@ -64,6 +72,12 @@ async def cmd_start(message: Message, bot: Bot):
         active_challenge = await db.get_active_challenge(message.from_user.id)
         if active_challenge:
             await challenge_render.resend_challenge_message(bot, active_challenge["id"])
+
+        if resumed:
+            await send_command_message(
+                bot, message.chat.id, "stop",
+                "Система возобновлена ✅ Ежедневные испытания снова будут приходить.",
+            )
         return
 
     text = (
@@ -180,4 +194,75 @@ async def group_instructions(call: CallbackQuery):
 @router.callback_query(F.data == "group_skip")
 async def group_skip(call: CallbackQuery, bot: Bot):
     await finish_registration(bot, call.from_user.id)
+    await call.answer()
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message, bot: Bot):
+    """
+    /stop - полностью останавливает Систему для игрока: ежедневные испытания
+    больше не создаются и не рассылаются (см. db.get_users_by_time, которая
+    пропускает пользователей с is_stopped=1 в scheduler.dispatch_daily_challenges),
+    пока игрок не введёт /start заново (см. cmd_start выше - там же снимается
+    остановка).
+
+    Подтверждение показывается ОТДЕЛЬНЫМ эфемерным сообщением ("Остановить
+    Систему?" + Да/Нет), живущим по той же логике "одно сообщение на команду"
+    + автоудаление, что и остальные ephemeral-ответы бота (см.
+    utils.send_command_message). Сама команда /stop удаляется автоматически
+    через DeleteCommandsMiddleware - отдельно чистить её тут не нужно.
+    """
+    user = await db.get_user(message.from_user.id)
+    if not user or user["reg_state"] != "done":
+        await send_command_message(bot, message.chat.id, "stop", "Сначала пройди регистрацию: /start")
+        return
+
+    if user.get("is_stopped"):
+        await send_command_message(
+            bot, message.chat.id, "stop", "Система уже остановлена. Набери /start, чтобы возобновить."
+        )
+        return
+
+    await send_command_message(
+        bot,
+        message.chat.id,
+        "stop",
+        "Остановить Систему? Ежедневные испытания перестанут приходить, пока ты не наберёшь /start.",
+        reply_markup=kb.confirm_stop_system_kb(message.from_user.id),
+    )
+
+
+@router.callback_query(F.data.startswith("stopsys_yes:"))
+async def on_stop_system_confirmed(call: CallbackQuery):
+    user_id = int(call.data.split(":")[1])
+    if call.from_user.id != user_id:
+        await call.answer()
+        return
+
+    await db.set_stopped(user_id, True)
+
+    # Подтверждение получено - эфемерное сообщение больше не нужно, не ждём
+    # истечения таймера автоудаления.
+    cancel_scheduled_delete(call.message.chat.id, call.message.message_id)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+    await call.answer("Система остановлена.")
+
+
+@router.callback_query(F.data.startswith("stopsys_no:"))
+async def on_stop_system_declined(call: CallbackQuery):
+    user_id = int(call.data.split(":")[1])
+    if call.from_user.id != user_id:
+        await call.answer()
+        return
+
+    cancel_scheduled_delete(call.message.chat.id, call.message.message_id)
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
     await call.answer()

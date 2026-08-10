@@ -146,6 +146,7 @@ class Database:
             "friend_prompt_message_id": "INTEGER",
             "daily_pullups": "INTEGER DEFAULT 0",
             "daily_running": "INTEGER DEFAULT 0",
+            "is_stopped": "INTEGER DEFAULT 0",  # /stop - Система приостановлена, дневные квесты не выдаются
         }
         changed = False
         for name, col_type in new_user_columns.items():
@@ -329,11 +330,23 @@ class Database:
         return active
 
     async def get_users_by_time(self, time_of_day: str) -> list[dict]:
+        # is_stopped=1 - игрок остановил Систему через /stop: пока он не введёт
+        # /start заново, ежедневные испытания ему не создаются и не рассылаются
+        # (см. handlers/start.py::cmd_stop / cmd_start).
         cur = await self._conn.execute(
-            "SELECT * FROM users WHERE time_of_day = ? AND reg_state = 'done'", (time_of_day,)
+            """SELECT * FROM users WHERE time_of_day = ? AND reg_state = 'done'
+               AND (is_stopped IS NULL OR is_stopped = 0)""",
+            (time_of_day,),
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+    async def set_stopped(self, user_id: int, stopped: bool):
+        """Ставит/снимает флаг остановки Системы (см. get_users_by_time)."""
+        await self._conn.execute(
+            "UPDATE users SET is_stopped = ? WHERE user_id = ?", (int(stopped), user_id)
+        )
+        await self._conn.commit()
 
     async def add_xp(self, user_id: int, amount: int):
         """

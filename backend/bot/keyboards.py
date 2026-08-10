@@ -83,21 +83,23 @@ def challenge_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def confirm_giveup_kb(challenge_id: int, source: str) -> InlineKeyboardMarkup:
-    """
-    Клавиатура подтверждения сдачи испытания: "Да" / "Нет".
-
-    source различает, ОТКУДА пришло подтверждение - "card" (кнопка "Сдаться"
-    прямо на карточке испытания, которая при этом полностью подменяется на
-    "Сдаться?") или "cmd" (отдельное эфемерное сообщение команды /stop). Это
-    нужно, чтобы обработчик ответа знал, что делать после выбора: вернуть
-    карточку испытания к обычному виду (card) или просто убрать эфемерное
-    сообщение (cmd) - см. handlers/challenge.py.
-    """
+def confirm_giveup_kb(challenge_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения сдачи испытания на карточке: "Да" / "Нет"."""
     rows = [
         [
-            InlineKeyboardButton(text="Да", callback_data=f"giveup_yes:{challenge_id}:{source}"),
-            InlineKeyboardButton(text="Нет", callback_data=f"giveup_no:{challenge_id}:{source}"),
+            InlineKeyboardButton(text="Да", callback_data=f"giveup_yes:{challenge_id}"),
+            InlineKeyboardButton(text="Нет", callback_data=f"giveup_no:{challenge_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def confirm_stop_system_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения остановки Системы командой /stop: "Да" / "Нет"."""
+    rows = [
+        [
+            InlineKeyboardButton(text="Да", callback_data=f"stopsys_yes:{user_id}"),
+            InlineKeyboardButton(text="Нет", callback_data=f"stopsys_no:{user_id}"),
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
