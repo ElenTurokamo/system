@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
@@ -10,6 +12,8 @@ from bot.config import FOCUS_OPTIONS, time_of_day_label
 from bot.database import db
 from bot.registration import finish_registration
 from bot.utils import cancel_scheduled_delete, send_command_message
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="start")
 
@@ -240,6 +244,24 @@ async def on_stop_system_confirmed(call: CallbackQuery):
         return
 
     await db.set_stopped(user_id, True)
+
+    # Сегодняшнее испытание (если есть) закрывается статусом 'stopped' (не
+    # штрафным - см. Database.stop_challenge) и убирается из чата: раз Система
+    # остановлена, дальше отслеживать его нет смысла, а висящая карточка с
+    # неактуальными кнопками только путала бы.
+    active_challenge = await db.get_active_challenge(user_id)
+    if active_challenge:
+        await db.stop_challenge(active_challenge["id"])
+        await db.record_daily_stats(active_challenge["id"])
+        if active_challenge.get("message_id"):
+            try:
+                await call.bot.delete_message(user_id, active_challenge["message_id"])
+            except Exception as e:
+                logger.info("Не удалось удалить карточку испытания при /stop %s: %s", user_id, e)
+
+    # Профиль редактируется на месте - is_stopped уже выставлен выше, поэтому
+    # render_profile_text сама добавит строку об остановке после всех статов.
+    await profile.sync_profile_message(call.bot, user_id)
 
     # Подтверждение получено - эфемерное сообщение больше не нужно, не ждём
     # истечения таймера автоудаления.

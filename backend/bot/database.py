@@ -521,6 +521,22 @@ class Database:
         )
         await self._conn.commit()
 
+    async def stop_challenge(self, challenge_id: int):
+        """
+        Закрывает испытание дня из-за остановки Системы командой /stop.
+
+        В отличие от give_up_challenge/expire_challenge, это НЕ штрафной статус -
+        игрок сам поставил Систему на паузу, а не провалил требование, поэтому
+        никакой отдельный статус-репорт по нему не шлётся (карточка просто
+        удаляется из чата, см. handlers/start.py::on_stop_system_confirmed) и
+        XP/стрик этим статусом не трогаются.
+        """
+        await self._conn.execute(
+            "UPDATE challenges SET status = 'stopped', active_focus = NULL, completed_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), challenge_id),
+        )
+        await self._conn.commit()
+
     async def get_awaiting_challenges(self) -> list[dict]:
         """Все испытания, которые сейчас активны (карточка ждёт действий игрока)."""
         cur = await self._conn.execute(
