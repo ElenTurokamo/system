@@ -83,6 +83,26 @@ def challenge_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def confirm_giveup_kb(challenge_id: int, source: str) -> InlineKeyboardMarkup:
+    """
+    Клавиатура подтверждения сдачи испытания: "Да" / "Нет".
+
+    source различает, ОТКУДА пришло подтверждение - "card" (кнопка "Сдаться"
+    прямо на карточке испытания, которая при этом полностью подменяется на
+    "Сдаться?") или "cmd" (отдельное эфемерное сообщение команды /stop). Это
+    нужно, чтобы обработчик ответа знал, что делать после выбора: вернуть
+    карточку испытания к обычному виду (card) или просто убрать эфемерное
+    сообщение (cmd) - см. handlers/challenge.py.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(text="Да", callback_data=f"giveup_yes:{challenge_id}:{source}"),
+            InlineKeyboardButton(text="Нет", callback_data=f"giveup_no:{challenge_id}:{source}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def friend_request_kb(friendship_id: int) -> InlineKeyboardMarkup:
     rows = [
         [

@@ -1,7 +1,9 @@
-from aiogram import F, Router
+from aiogram import Bot, F, Router
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from bot import challenge_render
+from bot import keyboards as kb
 from bot import messages as tx
 from bot import profile
 from bot.config import (
@@ -12,6 +14,7 @@ from bot.config import (
     xp_reward_for_challenge,
 )
 from bot.database import db
+from bot.utils import cancel_scheduled_delete, send_command_message
 
 router = Router(name="challenge")
 
@@ -182,8 +185,41 @@ async def on_finish_challenge(call: CallbackQuery):
     await call.answer()
 
 
+async def _execute_give_up(bot: Bot, challenge: dict):
+    """
+    Собственно сдача испытания - вынесено отдельно, т.к. вызывается из двух
+    мест после подтверждения: с кнопки "Сдаться" на карточке (см.
+    on_give_up_confirmed, source="card") и из команды /stop (source="cmd").
+    """
+    challenge_id = challenge["id"]
+    user_id = challenge["user_id"]
+
+    await db.give_up_challenge(challenge_id)
+    await db.record_daily_stats(challenge_id)
+    await db.reset_streak(user_id)
+    # "Сдался" - это тоже пропущенный день: та же XP-плата и то же ограничение,
+    # что и при обычной просрочке (см. scheduler.expire_stale_challenges).
+    await db.add_xp(user_id, -settings.missed_day_xp_penalty)
+    await db.set_penalty(user_id, settings.penalty_hours)
+
+    await challenge_render.close_failed_challenge(
+        bot,
+        challenge_id,
+        tx.challenge_failed(
+            "gave_up", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
+        ),
+    )
+    await profile.sync_profile_message(bot, user_id)
+
+
 @router.callback_query(F.data.startswith("giveup:"))
-async def on_give_up(call: CallbackQuery):
+async def on_give_up_request(call: CallbackQuery):
+    """
+    Первый клик по "🏳 Сдаться" больше не сдаёт испытание сразу - он полностью
+    подменяет карточку испытания на экран подтверждения "Сдаться?" с кнопками
+    "Да"/"Нет" (см. challenge_render.push_giveup_confirm). Собственно сдача
+    происходит только после явного "Да" - см. on_give_up_confirmed.
+    """
     challenge_id = int(call.data.split(":")[1])
     challenge = await db.get_challenge(challenge_id)
     if not challenge or challenge["user_id"] != call.from_user.id:
@@ -193,20 +229,84 @@ async def on_give_up(call: CallbackQuery):
         await call.answer("Испытание уже закрыто.", show_alert=True)
         return
 
-    await db.give_up_challenge(challenge_id)
-    await db.record_daily_stats(challenge_id)
-    await db.reset_streak(call.from_user.id)
-    # "Сдался" - это тоже пропущенный день: та же XP-плата и то же ограничение,
-    # что и при обычной просрочке (см. scheduler.expire_stale_challenges).
-    await db.add_xp(call.from_user.id, -settings.missed_day_xp_penalty)
-    await db.set_penalty(call.from_user.id, settings.penalty_hours)
-
-    await challenge_render.close_failed_challenge(
-        call.bot,
-        challenge_id,
-        tx.challenge_failed(
-            "gave_up", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
-        ),
-    )
-    await profile.sync_profile_message(call.bot, call.from_user.id)
+    await challenge_render.push_giveup_confirm(call.bot, challenge_id)
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("giveup_yes:"))
+async def on_give_up_confirmed(call: CallbackQuery):
+    _, challenge_id, source = call.data.split(":")
+    challenge_id = int(challenge_id)
+
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge or challenge["user_id"] != call.from_user.id:
+        await call.answer()
+        return
+    if challenge["status"] != "awaiting_action":
+        await call.answer("Испытание уже закрыто.", show_alert=True)
+        return
+
+    await _execute_give_up(call.bot, challenge)
+
+    if source == "cmd":
+        # Подтверждение пришло из отдельного эфемерного сообщения /stop (а не
+        # с карточки испытания, которую уже закрыл _execute_give_up через
+        # close_failed_challenge) - его больше незачем держать до истечения
+        # таймера автоудаления.
+        cancel_scheduled_delete(call.message.chat.id, call.message.message_id)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("giveup_no:"))
+async def on_give_up_declined(call: CallbackQuery):
+    _, challenge_id, source = call.data.split(":")
+    challenge_id = int(challenge_id)
+
+    if source == "card":
+        # Возвращаем карточку испытания к обычному виду - если она к этому
+        # моменту ещё жива (испытание не истекло/не изменилось иным путём).
+        challenge = await db.get_challenge(challenge_id)
+        if challenge and challenge["status"] == "awaiting_action":
+            await challenge_render.push_challenge_update(call.bot, challenge_id)
+    else:
+        # source == "cmd" - просто убираем эфемерное сообщение /stop, ждать
+        # истечения таймера автоудаления не нужно.
+        cancel_scheduled_delete(call.message.chat.id, call.message.message_id)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+
+    await call.answer()
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message, bot: Bot):
+    """
+    /stop - альтернативный способ сдаться, не завязанный на то, что карточка
+    испытания видна в чате (например, если её локально скрыли/пролистали).
+
+    Подтверждение показывается ОТДЕЛЬНЫМ эфемерным сообщением ("Сдаться?" +
+    Да/Нет), а не на самой карточке испытания - живёт по той же логике
+    "одно сообщение на команду" + автоудаление, что и остальные ephemeral-
+    ответы бота (см. utils.send_command_message). Сама команда /stop
+    удаляется автоматически через DeleteCommandsMiddleware, как и любая
+    другая команда - отдельно чистить её тут не нужно.
+    """
+    challenge = await db.get_active_challenge(message.from_user.id)
+    if not challenge:
+        await send_command_message(bot, message.chat.id, "stop", "Активного испытания нет.")
+        return
+
+    await send_command_message(
+        bot,
+        message.chat.id,
+        "stop",
+        "Сдаться?",
+        reply_markup=kb.confirm_giveup_kb(challenge["id"], "cmd"),
+    )

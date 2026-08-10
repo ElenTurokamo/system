@@ -197,6 +197,31 @@ async def push_challenge_update(bot: Bot, challenge_id: int):
         logger.info("Не удалось обновить сообщение испытания %s: %s", challenge_id, e)
 
 
+async def push_giveup_confirm(bot: Bot, challenge_id: int):
+    """
+    Полностью подменяет карточку испытания на экран подтверждения сдачи:
+    текст - просто "Сдаться?", клавиатура - "Да"/"Нет" (см. keyboards.confirm_giveup_kb).
+
+    Это тот же принцип редактирования единственного сообщения испытания, что и
+    у push_challenge_update - никакого нового сообщения не создаётся. Если
+    игрок нажмёт "Нет", карточка возвращается к обычному виду через обычный
+    push_challenge_update (см. handlers/challenge.py).
+    """
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge or not challenge.get("message_id"):
+        return
+
+    try:
+        await bot.edit_message_text(
+            "Сдаться?",
+            chat_id=challenge["user_id"],
+            message_id=challenge["message_id"],
+            reply_markup=kb.confirm_giveup_kb(challenge_id, "card"),
+        )
+    except Exception as e:
+        logger.info("Не удалось показать подтверждение сдачи %s: %s", challenge_id, e)
+
+
 async def close_failed_challenge(bot: Bot, challenge_id: int, failure_text: str):
     """
     Единая точка закрытия ПРОВАЛЕННОГО испытания - неважно, истёк таймаут или
