@@ -253,6 +253,8 @@ async def on_stop_system_confirmed(call: CallbackQuery):
     if active_challenge:
         await db.stop_challenge(active_challenge["id"])
         await db.record_daily_stats(active_challenge["id"])
+        # Предупреждение "до провала осталось..." после остановки Системы неактуально.
+        await challenge_render.clear_warning_message(call.bot, active_challenge["id"])
         if active_challenge.get("message_id"):
             try:
                 await call.bot.delete_message(user_id, active_challenge["message_id"])

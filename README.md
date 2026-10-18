@@ -123,7 +123,9 @@ A cron job runs for each of the 4 time slots (`TIME_MORNING` / `TIME_DAY` / `TIM
 - Send a number → it's added to `daily_<focus>` in the DB, **+100 XP** is awarded, streak **+1**, level recalculated (`level = xp // 1000 + 1`).
 - You're then prompted for a photo. If a group is bound, the photo is forwarded there with an auto-generated caption like *"Day N. Player `user_id` completed the challenge."*
 - **Give Up** → streak resets to 0 and `penalty_until = now + 48h` is stored (a soft, in-app penalty marker — the bot obviously can't enforce real device restrictions).
-- A separate job runs every 15 minutes and expires any quest older than `CHALLENGE_TIMEOUT_HOURS` (default: 18h) that was never finished, resetting the streak.
+- A separate job runs every minute and expires any quest older than `CHALLENGE_TIMEOUT_HOURS` (default: 18h) that was never finished, resetting the streak and applying the penalty.
+- **Failure warnings:** the player gets a push 60, 30 and 15 minutes before the quest fails (the previous warning is deleted when the next one arrives, and all of them are removed when the quest closes). In the last 15 minutes the card timer switches to `MM:SS` and refreshes every `CHALLENGE_COUNTDOWN_REFRESH_SECONDS` (default 1).
+- **Penalty pause:** after a failure (timeout or Give Up) no new quests are issued until the penalty timer shown in the profile runs out; skipped slots are simply not dispatched.
 
 </details>
 

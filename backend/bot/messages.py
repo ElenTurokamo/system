@@ -170,6 +170,42 @@ def challenge_failed(reason: str, xp_loss: int = 0, penalty_hours: int = 0) -> s
     )
 
 
+def _warning_time_phrase(minutes: int) -> str:
+    if minutes == 60:
+        return "менее часа"
+    if minutes % 10 == 1 and minutes % 100 != 11:
+        return f"менее {minutes} минуты"
+    return f"менее {minutes} минут"
+
+
+def challenge_warning(minutes: int, xp_loss: int = 0, penalty_hours: int = 0) -> str:
+    """
+    Предупреждение о скором провале дневного квеста: приходит отдельным
+    сообщением (с обычным звуком) за 60, 30 и 15 минут до дедлайна - см.
+    challenge_render.maybe_send_failure_warning. Оформлено в том же стиле
+    "окна Системы", что и challenge_failed, и так же ФИКСИРОВАНО (без банка
+    случайных фраз) - меняется только оставшееся время.
+
+    minutes - порог, который только что пересёк таймер; формулировка "менее N"
+    (а не "ровно N") честна и в том случае, если бот был недоступен и
+    предупреждение ушло с небольшим опозданием.
+    """
+    phrase = _warning_time_phrase(minutes)
+    return (
+        "⚠ 『 Предупреждение Системы 』 ⚠\n"
+        "──────────────────\n"
+        f"До провала дневного квеста осталось {phrase}.\n"
+        "Закрой все цели и заверши испытание вовремя.\n"
+        "──────────────────\n"
+        "При провале будет наложена кара:\n"
+        f"▸ Опыт: −{xp_loss} XP\n"
+        "▸ Серия дней: обнулена\n"
+        f"▸ Ограничение доступа: {penalty_hours} ч\n"
+        "──────────────────\n"
+        "Время идёт."
+    )
+
+
 def level_up(level: int) -> str:
     template = random.choice(_BANK["level_up"]["templates"])
     return template.format(level=level)

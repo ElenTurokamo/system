@@ -8,6 +8,8 @@ challenge.py устроен вокруг challenge_render.py.
 import asyncio
 import logging
 
+import html
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
@@ -115,7 +117,7 @@ async def on_friend_code_entered(message: Message, bot: Bot):
     level, _, _ = level_from_total_xp(requester["xp"])
     notice = (
         "🔔 Обнаружен запрос на объединение.\n\n"
-        f"Игрок {display_name(requester)} (уровень {level}) хочет добавить тебя в друзья."
+        f"Игрок {html.escape(display_name(requester))} (уровень {level}) хочет добавить тебя в друзья."
     )
     try:
         await bot.send_message(
@@ -131,7 +133,7 @@ async def on_friend_code_entered(message: Message, bot: Bot):
         return
 
     await send_command_message(
-        bot, message.chat.id, "add_friend", f"Запрос в друзья отправлен игроку {display_name(target)}."
+        bot, message.chat.id, "add_friend", f"Запрос в друзья отправлен игроку {html.escape(display_name(target))}."
     )
 
 
@@ -155,7 +157,7 @@ async def on_friend_request_response(call: CallbackQuery, bot: Bot):
         try:
             notice = await bot.send_message(
                 friendship["requester_id"],
-                f"✅ {display_name(addressee)} принял(а) твой запрос в друзья.",
+                f"✅ {html.escape(display_name(addressee))} принял(а) твой запрос в друзья.",
             )
             schedule_delete(bot, notice.chat.id, notice.message_id)
         except Exception as e:

@@ -5,26 +5,42 @@
 регистрации) и затем просто редактируется — при завершении испытания,
 при просрочке, при повторной привязке группы и т.п. Никакого мусора в чате.
 
-ВАЖНО про пересоздание сообщения: единственные места, где профиль разрешено
-ПЕРЕСОЗДАТЬ (удалить старое + прислать и закрепить новое), - явная команда
-/profile (см. handlers/misc.py) и ежедневный диспетчер квестов в момент
-выдачи испытания на СВОЙ временной слот игрока (см.
-scheduler.dispatch_daily_challenges -> profile.ensure_fresh_profile_message).
-Все остальные автоматические обновления (sync_profile_message) - только
-edit на месте, без пересоздания, даже если edit не удался. Так пересоздание
-(и связанный с ним пуш) не может случиться чаще раза в день и не может
-случиться в случайный момент от фоновой джобы - только в то время, которое
-сам игрок выбрал для своих испытаний.
+Как обновляется сообщение (см. sync_profile_message):
+  1. Обычное обновление - edit на месте. Прежде чем признать, что edit не
+     удался, делается МИНИМУМ 3 попытки (settings.profile_retry_attempts, не
+     меньше 3; flood-control учитывается по RetryAfter).
+  2. Переотправка (удалить старое + прислать и закрепить новое) происходит
+     автоматически, только если ВСЕ попытки edit провалились именно потому,
+     что сообщения больше нет / оно не редактируется (удалено игроком, старше
+     лимита Telegram и т.п.). Попытки идут с шагом
+     settings.profile_edit_retry_interval_seconds (30 с). На временные сбои (сеть, 5xx, flood-control) и
+     на блокировку бота переотправка НЕ срабатывает - иначе в чате копились бы
+     дубликаты (это и была причина прежнего запрета на пересоздание из sync).
+  3. Помимо этого профиль пересоздаётся: явной командой /profile (и /start),
+     а также диспетчером квестов, когда сообщение "стареет" (см.
+     ensure_fresh_profile_message).
+
+Любая отправка нового сообщения профиля (_replace_profile) выглядит одинаково:
+  открепить ВСЕ закреплённые сообщения чата -> отправить новое -> закрепить ->
+  удалить старое. Служебные записи "бот закрепил сообщение" удаляет хендлер
+  handlers/misc.py::on_pin_service_message (Telegram при ОТкреплении служебного
+  сообщения в чате не создаёт - убирать там нечего). Все шаги - с повторными
+  попытками (utils.call_with_retries), а операции над профилем одного игрока
+  сериализуются блокировкой, чтобы параллельные обновления (джоба таймера
+  штрафа + ввод подхода игроком) не создали два профиля одновременно.
 """
+import asyncio
+import html
 import json
 import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
 from bot.config import FOCUS_OPTIONS, level_from_total_xp, settings, time_of_day_label
 from bot.database import db
+from bot.utils import RETRY_AFTER_CAP_SECONDS, call_with_retries
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +76,10 @@ def penalty_block(user: dict) -> str:
     if not penalty_until:
         return ""
 
-    until = datetime.fromisoformat(penalty_until)
+    try:
+        until = datetime.fromisoformat(penalty_until)
+    except (TypeError, ValueError):
+        return ""  # испорченное значение в БД не должно ронять отрисовку всего профиля
     remaining = until - datetime.utcnow()
     if remaining.total_seconds() <= 0:
         return ""
@@ -115,15 +134,20 @@ def get_tracked_focus_keys(user: dict) -> set[str]:
         return set()
 
 
-def focus_stat_line(focus_key: str, user: dict) -> str:
+def focus_stat_line(focus_key: str, user: dict, bold: bool = False) -> str:
     """
     Одна строка статистики по дисциплине - вынесено отдельно, чтобы бриф
     друга (bot/friends.py) форматировал числа ТОЧНО так же, как личный
     профиль, вместо дублирования f-строк в двух местах.
+
+    bold=True оборачивает строку в <b>...</b> (сообщения бота отправляются с
+    ParseMode.HTML) - так в личном профиле выделяются дисциплины, которые
+    игрок отслеживает ПРЯМО СЕЙЧАС.
     """
     opt = FOCUS_OPTIONS[focus_key]
     unit_suffix = f" ({opt['unit']})" if opt["unit"] != "раз" else ""
-    return f"{opt['label']}{unit_suffix}: {user[opt['counter_field']]}"
+    line = html.escape(f"{opt['label']}{unit_suffix}: {user[opt['counter_field']]}", quote=False)
+    return f"<b>{line}</b>" if bold else line
 
 
 def render_profile_text(
@@ -139,7 +163,7 @@ def render_profile_text(
 
     header = (
         "『Профиль Игрока』\n\n"
-        f"🆔 {display_name(user)} · #<code>{player_code(user)}</code>\n"
+        f"🆔 {html.escape(display_name(user))} · #<code>{player_code(user)}</code>\n"
         f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
         f"🔥 Серия: {streak} {ru_days(streak)}\n\n"
         f"⏰ Время испытаний: {time_label}\n"
@@ -158,7 +182,10 @@ def render_profile_text(
     history_keys = set(history_focus_keys or ())
     visible_keys = [k for k in FOCUS_OPTIONS if k in tracked_keys or k in history_keys]
 
-    stat_lines: list[str] = [focus_stat_line(k, user) for k in visible_keys]
+    # Отслеживаемые сейчас дисциплины выделяются жирным - так сразу видно, какие
+    # из показанных строк "живые", а какие остались только как история прогресса
+    # по дисциплинам, которые игрок уже убрал через /change_focus.
+    stat_lines: list[str] = [focus_stat_line(k, user, bold=(k in tracked_keys)) for k in visible_keys]
 
     stats = (
         "\n".join(stat_lines)
@@ -233,135 +260,284 @@ def _is_profile_stale(user: dict) -> bool:
     return datetime.utcnow() - created >= timedelta(hours=threshold_hours)
 
 
-async def sync_profile_message(bot: Bot, user_id: int):
-    """
-    Обновляет закреплённую сводку профиля пользователя лёгким edit'ом НА МЕСТЕ.
-    Используется для всех автоматических обновлений (испытание завершено/просрочено/
-    группа привязана, обновление таймера штрафа и т.п.).
+# Блокировки на игрока: все операции, меняющие/пересоздающие сообщение профиля,
+# выполняются строго по очереди. Без этого, например, минутная джоба таймера
+# штрафа и ввод подхода игроком (оба зовут sync_profile_message) могли бы
+# одновременно прийти к выводу "профиля нет/он пропал" и создать два профиля.
+_profile_locks: dict[int, asyncio.Lock] = {}
 
-    Эта функция НИКОГДА не пересоздаёт сообщение. Если редактирование не удалось
-    (сообщение удалено пользователем, устарело для editMessageText, временная
-    ошибка/flood-control Telegram и т.п.) - ошибка просто логируется, а актуальный
-    текст подтянется при следующем вызове. Пересоздание сообщения (и связанный с
-    ним пуш) - отдельная операция, доступная только через resend_profile_message /
-    ensure_fresh_profile_message (см. их докстринги и докстринг модуля выше);
-    раньше эта функция сама пересоздавала сообщение при ЛЮБОЙ ошибке edit'а
-    (включая временные вроде flood-control), из-за чего в чате копились
-    непогашенные дубликаты профиля с лишними пуш-уведомлениями в случайное
-    время суток - именно это здесь и исправлено.
 
-    Если сообщения профиля ещё нет вообще (первая регистрация) - создаёт его.
-    """
-    user = await db.get_user(user_id)
-    if not user:
-        return
+def _profile_lock(user_id: int) -> asyncio.Lock:
+    lock = _profile_locks.get(user_id)
+    if lock is None:
+        lock = _profile_locks[user_id] = asyncio.Lock()
+    return lock
 
+
+async def _build_profile_text(user: dict) -> str:
+    user_id = user["user_id"]
     latest_challenge = await db.get_latest_challenge(user_id)
     quest_done_today = bool(
         latest_challenge and latest_challenge["status"] in ("completed", "completed_with_photo")
     )
     bonus_claimed_today = bool(quest_done_today and latest_challenge.get("bonus_claimed"))
     history_focus_keys = await db.get_focus_keys_with_history(user_id)
-    text = render_profile_text(user, quest_done_today, bonus_claimed_today, history_focus_keys)
+    return render_profile_text(user, quest_done_today, bonus_claimed_today, history_focus_keys)
 
-    if not user.get("profile_message_id"):
-        # Профиля ещё не существует (первая регистрация) - создаём и закрепляем.
-        await _send_and_pin(bot, user_id, text)
+
+def _is_message_gone(error_text: str) -> bool:
+    """
+    True, если текст ошибки Telegram означает, что сообщение профиля больше не
+    существует или не может быть отредактировано (удалено игроком, слишком
+    старое и т.п.) - то есть единственный выход - прислать профиль заново.
+    """
+    t = error_text.lower()
+    return (
+        "message to edit not found" in t
+        or "message can't be edited" in t
+        or "message_id_invalid" in t
+        or "message identifier is not specified" in t
+    )
+
+
+# Исход попыток отредактировать профиль на месте.
+_EDIT_OK = "ok"  # отредактировано (или текст не изменился)
+_EDIT_GONE = "gone"  # все попытки провалились, сообщения больше нет/не редактируется
+_EDIT_FAILED = "failed"  # временный сбой/прочее - переотправлять НЕ нужно
+_EDIT_FORBIDDEN = "forbidden"  # бот заблокирован игроком - ни edit, ни resend не помогут
+
+
+async def _edit_in_place(bot: Bot, user: dict, text: str) -> str:
+    """
+    Редактирует сообщение профиля на месте, делая не меньше
+    settings.profile_retry_attempts (минимум 3) попыток, и возвращает один из
+    _EDIT_*. Исход определяется ПОСЛЕДНЕЙ попыткой: если сообщение пропало
+    только на третьей попытке, а на первых двух был сетевой сбой - всё равно
+    "gone", потому что именно это состояние актуально сейчас.
+    """
+    attempts = max(3, settings.profile_retry_attempts)
+    outcome = _EDIT_FAILED
+    for attempt in range(1, attempts + 1):
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=user["profile_chat_id"],
+                message_id=user["profile_message_id"],
+            )
+            return _EDIT_OK
+        except TelegramForbiddenError:
+            return _EDIT_FORBIDDEN
+        except TelegramRetryAfter as e:
+            outcome = _EDIT_FAILED
+            logger.info("Профиль %s: flood-control, попытка %s/%s", user["user_id"], attempt, attempts)
+            if attempt < attempts:
+                await asyncio.sleep(
+                    max(settings.profile_edit_retry_interval_seconds,
+                        min(float(e.retry_after) + 0.5, RETRY_AFTER_CAP_SECONDS))
+                )
+            continue
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return _EDIT_OK  # текст не изменился с прошлого раза - это нормально
+            outcome = _EDIT_GONE if _is_message_gone(str(e)) else _EDIT_FAILED
+            logger.info("Профиль %s: edit, попытка %s/%s не удалась: %s", user["user_id"], attempt, attempts, e)
+        except Exception as e:
+            outcome = _EDIT_FAILED
+            logger.info("Профиль %s: edit, попытка %s/%s не удалась: %s", user["user_id"], attempt, attempts, e)
+
+        if attempt < attempts:
+            await asyncio.sleep(settings.profile_edit_retry_interval_seconds)
+    return outcome
+
+
+async def _unpin_all(bot: Bot, chat_id: int, fallback_message_id: int | None = None) -> None:
+    """
+    Открепляет ВСЕ закреплённые сообщения в чате (а не только прошлый профиль):
+    перед отправкой нового профиля в закрепе не должно оставаться ничего
+    лишнего. Если массовое открепление не удалось даже с повторами - пробуем
+    хотя бы открепить прошлый профиль по id. Ошибки только логируются: на
+    отправку нового профиля это не должно влиять.
+    """
+    attempts = max(3, settings.profile_retry_attempts)
+    try:
+        await call_with_retries(
+            lambda: bot.unpin_all_chat_messages(chat_id),
+            attempts=attempts,
+            delay=settings.profile_retry_delay_seconds,
+            what=f"открепление всех сообщений {chat_id}",
+        )
         return
+    except Exception as e:
+        logger.warning("Не удалось открепить все сообщения в чате %s: %s", chat_id, e)
+
+    if fallback_message_id:
+        try:
+            await call_with_retries(
+                lambda: bot.unpin_chat_message(chat_id, message_id=fallback_message_id),
+                attempts=attempts,
+                delay=settings.profile_retry_delay_seconds,
+                what=f"открепление профиля {chat_id}",
+            )
+        except Exception as e:
+            logger.warning("Не удалось открепить прежний профиль %s: %s", chat_id, e)
+
+
+async def _delete_message_with_retries(bot: Bot, chat_id: int, message_id: int) -> bool:
+    """Удаляет сообщение с повторами. 'Уже удалено' считается успехом. True - сообщения больше нет."""
+
+    async def _delete():
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except TelegramBadRequest as e:
+            if "message to delete not found" in str(e).lower():
+                return
+            raise
 
     try:
-        await bot.edit_message_text(
-            text,
-            chat_id=user["profile_chat_id"],
-            message_id=user["profile_message_id"],
+        await call_with_retries(
+            _delete,
+            attempts=max(3, settings.profile_retry_attempts),
+            delay=settings.profile_retry_delay_seconds,
+            what=f"удаление сообщения {message_id}",
         )
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
-            # Текст не изменился с прошлого раза - это нормально, ничего не делаем.
-            return
-        logger.info(
-            "Не удалось обновить сводку профиля %s (НЕ пересоздаю, попробую в "
-            "следующий раз): %s", user_id, e
+        return True
+    except Exception as e:
+        logger.warning("Не удалось удалить сообщение %s в чате %s: %s", message_id, chat_id, e)
+        return False
+
+
+async def _replace_profile(bot: Bot, user: dict, text: str) -> bool:
+    """
+    Единственная точка, где отправляется НОВОЕ сообщение профиля. Вызывать
+    только под _profile_lock(user_id). Порядок:
+
+      1. открепить все закреплённые сообщения чата;
+      2. отправить новый профиль (с повторами; без звука - пересоздание
+         профиля само по себе не повод для пуша);
+      3. записать его id в БД и закрепить (служебное "бот закрепил сообщение"
+         удаляет хендлер on_pin_service_message);
+      4. удалить прежнее сообщение профиля.
+
+    Если отправка нового сообщения не удалась даже с повторами - прежнее
+    сообщение НЕ удаляется (у игрока остаётся хоть какой-то профиль), его
+    закреп восстанавливается по возможности, возвращается False.
+    """
+    user_id = user["user_id"]
+    chat_id = user_id  # профиль всегда живёт в личке с игроком
+    old_chat_id = user.get("profile_chat_id") or chat_id
+    old_message_id = user.get("profile_message_id")
+    attempts = max(3, settings.profile_retry_attempts)
+
+    await _unpin_all(bot, chat_id, fallback_message_id=old_message_id)
+
+    try:
+        msg = await call_with_retries(
+            lambda: bot.send_message(chat_id, text, disable_notification=True),
+            attempts=attempts,
+            delay=settings.profile_retry_delay_seconds,
+            what=f"отправка профиля {user_id}",
         )
     except Exception as e:
-        logger.info(
-            "Не удалось обновить сводку профиля %s (НЕ пересоздаю, попробую в "
-            "следующий раз): %s", user_id, e
+        logger.warning("Не удалось отправить сводку профиля %s: %s", user_id, e)
+        if old_message_id:
+            try:
+                await bot.pin_chat_message(old_chat_id, old_message_id, disable_notification=True)
+            except Exception:
+                pass
+        return False
+
+    await db.set_profile_message(user_id, chat_id, msg.message_id)
+
+    try:
+        await call_with_retries(
+            lambda: bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True),
+            attempts=attempts,
+            delay=settings.profile_retry_delay_seconds,
+            what=f"закрепление профиля {user_id}",
         )
+    except Exception as e:
+        logger.info("Не удалось закрепить сводку профиля %s: %s", user_id, e)
+
+    if old_message_id and (old_chat_id, old_message_id) != (chat_id, msg.message_id):
+        await _delete_message_with_retries(bot, old_chat_id, old_message_id)
+    return True
+
+
+async def sync_profile_message(bot: Bot, user_id: int):
+    """
+    Обновляет закреплённую сводку профиля лёгким edit'ом НА МЕСТЕ. Используется
+    для всех автоматических обновлений (испытание завершено/просрочено/группа
+    привязана, таймер штрафа и т.п.).
+
+    Не меньше 3 попыток edit (см. _edit_in_place). Если ВСЕ они провалились
+    потому, что сообщения профиля больше нет или оно не редактируется - профиль
+    переотправляется (см. _replace_profile). При временных сбоях и блокировке
+    бота ничего не пересоздаётся: актуальный текст подтянется при следующем
+    вызове.
+
+    Если сообщения профиля ещё нет вообще (первая регистрация) - создаёт его.
+    """
+    async with _profile_lock(user_id):
+        user = await db.get_user(user_id)
+        if not user:
+            return
+        text = await _build_profile_text(user)
+
+        if not user.get("profile_message_id"):
+            await _replace_profile(bot, user, text)
+            return
+
+        result = await _edit_in_place(bot, user, text)
+        if result == _EDIT_GONE:
+            logger.warning(
+                "Профиль %s: сообщения больше нет или оно не редактируется "
+                "(после всех попыток) - переотправляю.", user_id
+            )
+            await _replace_profile(bot, user, text)
+        elif result == _EDIT_FAILED:
+            logger.info("Профиль %s: не удалось обновить (НЕ пересоздаю, попробую в следующий раз)", user_id)
+        elif result == _EDIT_FORBIDDEN:
+            logger.info("Профиль %s: бот заблокирован игроком, обновление пропущено", user_id)
 
 
 async def ensure_fresh_profile_message(bot: Bot, user_id: int):
     """
     Используется ИСКЛЮЧИТЕЛЬНО ежедневным диспетчером квестов
     (см. scheduler.dispatch_daily_challenges), вызывается один раз в день - в
-    момент выдачи испытания на собственный временной слот игрока.
+    момент выдачи испытания на собственный временной слот игрока (а также в
+    слот, пропущенный из-за действующего ограничения - чтобы профиль не
+    "состарился" за время паузы).
 
     Если сообщение профиля приближается к границе, после которой Telegram
     перестанет давать его редактировать (см. _is_profile_stale) - пересоздаёт
-    его (resend_profile_message). Иначе - обычный лёгкий edit (sync_profile_message).
-
-    Это единственное место (не считая явной команды /profile), где профиль
-    может быть пересоздан автоматически - поэтому пересоздание никогда не
-    происходит чаще раза в день и всегда в то время, которое сам игрок задал
-    для своих испытаний, а не по расписанию отдельной фоновой джобы.
+    его. Иначе - обычный лёгкий edit (sync_profile_message).
     """
-    user = await db.get_user(user_id)
-    if not user:
-        return
+    async with _profile_lock(user_id):
+        user = await db.get_user(user_id)
+        if not user:
+            return
+        if user.get("profile_message_id") and _is_profile_stale(user):
+            text = await _build_profile_text(user)
+            await _replace_profile(bot, user, text)
+            return
 
-    if user.get("profile_message_id") and _is_profile_stale(user):
-        await resend_profile_message(bot, user_id)
-    else:
-        await sync_profile_message(bot, user_id)
+    await sync_profile_message(bot, user_id)
 
 
 async def resend_profile_message(bot: Bot, user_id: int):
     """
-    Принудительно пересоздаёт сводку профиля: удаляет старое сообщение (если получится)
-    и присылает + закрепляет новое.
+    Принудительно пересоздаёт сводку профиля: открепляет всё закреплённое,
+    присылает и закрепляет новое сообщение, удаляет старое.
 
-    Используется командой /profile - Telegram не даёт боту способа узнать, очистил ли
-    пользователь историю чата локально (edit_message_text в этом случае "успешно"
-    редактирует невидимое сообщение), поэтому единственный надёжный способ гарантировать
-    видимость профиля по явному запросу - переслать его заново.
-
-    Также вызывается диспетчером ежедневных квестов через ensure_fresh_profile_message,
-    когда текущее сообщение профиля приближается к границе редактирования Telegram -
-    это единственные два места, где профиль пересоздаётся автоматически (см. докстринг
-    модуля выше и sync_profile_message).
+    Используется командами /profile и /start - Telegram не даёт боту способа
+    узнать, очистил ли пользователь историю чата локально (edit_message_text в
+    этом случае "успешно" редактирует невидимое сообщение), поэтому единственный
+    надёжный способ гарантировать видимость профиля по явному запросу -
+    переслать его заново.
     """
-    user = await db.get_user(user_id)
-    if not user:
-        return
-
-    latest_challenge = await db.get_latest_challenge(user_id)
-    quest_done_today = bool(
-        latest_challenge and latest_challenge["status"] in ("completed", "completed_with_photo")
-    )
-    bonus_claimed_today = bool(quest_done_today and latest_challenge.get("bonus_claimed"))
-    history_focus_keys = await db.get_focus_keys_with_history(user_id)
-    text = render_profile_text(user, quest_done_today, bonus_claimed_today, history_focus_keys)
-
-    if user.get("profile_message_id"):
-        try:
-            await bot.delete_message(user["profile_chat_id"], user["profile_message_id"])
-        except Exception:
-            pass  # уже удалено/недоступно - не страшно, всё равно создадим новое
-
-    await _send_and_pin(bot, user_id, text)
-
-
-async def _send_and_pin(bot: Bot, user_id: int, text: str):
-    try:
-        # disable_notification=True - (пере)создание сообщения профиля само по себе
-        # не несёт новой информации, достойной пуша (в отличие от карточки квеста);
-        # без этого каждое пересоздание било лишним уведомлением поверх и так уже
-        # отправленного пуша дневного испытания.
-        msg = await bot.send_message(user_id, text, disable_notification=True)
-        await db.set_profile_message(user_id, user_id, msg.message_id)
-        try:
-            await bot.pin_chat_message(user_id, msg.message_id, disable_notification=True)
-        except Exception as e:
-            logger.info("Не удалось закрепить сводку профиля %s: %s", user_id, e)
-    except Exception as e:
-        logger.warning("Не удалось отправить сводку профиля %s: %s", user_id, e)
+    async with _profile_lock(user_id):
+        user = await db.get_user(user_id)
+        if not user:
+            return
+        text = await _build_profile_text(user)
+        await _replace_profile(bot, user, text)

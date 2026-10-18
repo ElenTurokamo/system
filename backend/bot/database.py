@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS challenges (
     started_at      TEXT,
     completed_at    TEXT,
     message_id      INTEGER,
+    warned_minutes  INTEGER,  -- наименьший порог (мин до провала), о котором игрока уже предупредили (60/30/15)
+    warning_message_id INTEGER, -- id текущего сообщения-предупреждения о скором провале (удаляется при закрытии)
     FOREIGN KEY(user_id) REFERENCES users(user_id)
 );
 
@@ -163,6 +165,8 @@ class Database:
             "bonus_claimed": "INTEGER DEFAULT 0",
             "physical_photo_done": "INTEGER DEFAULT 0",
             "physical_photo_posted": "INTEGER DEFAULT 0",
+            "warned_minutes": "INTEGER",
+            "warning_message_id": "INTEGER",
         }
         for name, col_type in new_challenge_columns.items():
             if name not in existing_challenges:
@@ -403,6 +407,23 @@ class Database:
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    @staticmethod
+    def is_penalty_active(user: Optional[dict]) -> bool:
+        """
+        True, пока у игрока действует ограничение за провал (penalty_until в
+        будущем). Пока это так, ежедневные испытания ему не выдаются (см.
+        scheduler.dispatch_daily_challenges). Некорректное/пустое значение
+        трактуется как "ограничения нет" - лучше выдать квест, чем навсегда
+        заблокировать игрока из-за испорченной строки в БД.
+        """
+        raw = (user or {}).get("penalty_until")
+        if not raw:
+            return False
+        try:
+            return datetime.fromisoformat(raw) > datetime.utcnow()
+        except (TypeError, ValueError):
+            return False
+
     async def set_penalty(self, user_id: int, hours: int):
         until = (datetime.utcnow() + timedelta(hours=hours)).isoformat()
         await self._conn.execute(
@@ -556,10 +577,46 @@ class Database:
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def expire_challenge(self, challenge_id: int):
-        await self._conn.execute(
-            "UPDATE challenges SET status = 'expired', active_focus = NULL WHERE id = ?",
+    async def expire_challenge(self, challenge_id: int) -> bool:
+        """
+        Помечает испытание просроченным, но ТОЛЬКО если оно всё ещё
+        awaiting_action. Возвращает True, если статус действительно сменился.
+
+        Условие нужно из-за гонки: пока планировщик разбирает список просроченных,
+        игрок мог в эту же секунду нажать "Завершить"/"Сдаться" - без проверки
+        мы перезаписали бы уже закрытое испытание статусом expired, сняли XP и
+        обнулили стрик у игрока, который успел вовремя.
+        """
+        cur = await self._conn.execute(
+            "UPDATE challenges SET status = 'expired', active_focus = NULL "
+            "WHERE id = ? AND status = 'awaiting_action'",
             (challenge_id,),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    # ---------- предупреждения о скором провале ----------
+
+    async def claim_warning_level(self, challenge_id: int, minutes: int) -> bool:
+        """
+        Атомарно "занимает" порог предупреждения (60/30/15 минут): True, если
+        этот порог ещё не отправлялся (warned_minutes пуст или больше minutes)
+        и испытание всё ещё активно. Значение только уменьшается, поэтому
+        повторный запуск джобы (или перезапуск бота) никогда не пришлёт одно
+        и то же предупреждение дважды и не вернётся к более раннему порогу.
+        """
+        cur = await self._conn.execute(
+            "UPDATE challenges SET warned_minutes = ? "
+            "WHERE id = ? AND status = 'awaiting_action' "
+            "AND (warned_minutes IS NULL OR warned_minutes > ?)",
+            (minutes, challenge_id, minutes),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    async def set_warning_message(self, challenge_id: int, message_id: Optional[int]):
+        await self._conn.execute(
+            "UPDATE challenges SET warning_message_id = ? WHERE id = ?", (message_id, challenge_id)
         )
         await self._conn.commit()
 

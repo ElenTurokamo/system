@@ -3,8 +3,10 @@
 """
 import asyncio
 import logging
+from typing import Awaitable, Callable, TypeVar
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
 logger = logging.getLogger(__name__)
 
@@ -111,3 +113,54 @@ async def send_command_message(
     sent = await bot.send_message(chat_id, text, **kwargs)
     track_command_message(bot, chat_id, command_key, sent.message_id, delay)
     return sent
+
+
+T = TypeVar("T")
+
+# Потолок ожидания, которое мы готовы отдать Telegram по RetryAfter внутри одной
+# попытки - чтобы flood-control на десятки секунд не подвешивал блокировку
+# профиля (см. profile.py) и планировщик надолго.
+RETRY_AFTER_CAP_SECONDS = 30.0
+
+
+async def call_with_retries(
+    factory: Callable[[], Awaitable[T]],
+    *,
+    attempts: int = 3,
+    delay: float = 1.0,
+    what: str = "вызов Telegram API",
+) -> T:
+    """
+    Выполняет `await factory()` до `attempts` раз подряд и возвращает первый
+    успешный результат. Если все попытки неудачны - пробрасывает ПОСЛЕДНЮЮ
+    ошибку (вызывающая сторона сама решает, что с ней делать).
+
+    - TelegramRetryAfter (flood-control): ждём ровно столько, сколько просит
+      Telegram (но не больше RETRY_AFTER_CAP_SECONDS), и пробуем снова.
+    - TelegramForbiddenError (бот заблокирован/кикнут): повторять бессмысленно,
+      пробрасывается сразу, без остальных попыток.
+    - Любая другая ошибка (сеть, 5xx, BadRequest): пауза delay * номер_попытки
+      (1с, 2с, ...) и новая попытка.
+
+    Важно: фабрика вызывается заново на каждой попытке, поэтому в неё нельзя
+    передавать уже созданную корутину - только лямбду/функцию.
+    """
+    attempts = max(1, attempts)
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await factory()
+        except TelegramForbiddenError:
+            raise
+        except TelegramRetryAfter as e:
+            last_exc = e
+            logger.info("%s: flood-control, попытка %s/%s (ждём %ss)", what, attempt, attempts, e.retry_after)
+            if attempt < attempts:
+                await asyncio.sleep(min(float(e.retry_after) + 0.5, RETRY_AFTER_CAP_SECONDS))
+        except Exception as e:  # noqa: BLE001 - осознанно ловим всё, решать будет вызывающий
+            last_exc = e
+            logger.info("%s: попытка %s/%s не удалась: %s", what, attempt, attempts, e)
+            if attempt < attempts:
+                await asyncio.sleep(delay * attempt)
+    assert last_exc is not None
+    raise last_exc

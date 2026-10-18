@@ -4,6 +4,8 @@
 единая точка правды за то, как это выглядит (по аналогии с profile.py и
 challenge_render.py).
 """
+import html
+
 from aiogram.types import InlineKeyboardMarkup
 
 from bot import keyboards as kb
@@ -114,7 +116,7 @@ async def render_brief(friend: dict, viewer_id: int, page: int) -> tuple[str, In
     )
 
     text = (
-        f"『 {display_name(friend)} 』\n\n"
+        f"『 {html.escape(display_name(friend))} 』\n\n"
         f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
         f"🔥 Серия: {streak} {ru_days(streak)}\n"
         f"📋 Испытание сегодня: {await status_label(friend['user_id'])}\n\n"
