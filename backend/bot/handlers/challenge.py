@@ -2,6 +2,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, Message
 
 from bot import challenge_render
+from bot import failure_policy
 from bot import messages as tx
 from bot import profile
 from bot.config import (
@@ -174,6 +175,8 @@ async def on_finish_challenge(call: CallbackQuery):
     await db.set_active_focus(challenge_id, None)
     await db.add_xp(call.from_user.id, reward)
     await db.increment_streak(call.from_user.id)
+    # Выполненное испытание прерывает серию провалов подряд (см. failure_policy).
+    await db.reset_failures(call.from_user.id)
     await db.complete_challenge(challenge_id, with_photo=bool(challenge["physical_photo_posted"]))
     await db.record_daily_stats(challenge_id)
 
@@ -187,13 +190,19 @@ async def _execute_give_up(bot: Bot, challenge: dict):
     challenge_id = challenge["id"]
     user_id = challenge["user_id"]
 
-    await db.give_up_challenge(challenge_id)
+    # Условный UPDATE: если испытание уже закрыто (двойное нажатие "Да" или
+    # планировщик успел просрочить его раньше) - второй штраф/провал не засчитываем.
+    if not await db.give_up_challenge(challenge_id):
+        return
     await db.record_daily_stats(challenge_id)
     await db.reset_streak(user_id)
     # "Сдался" - это тоже пропущенный день: та же XP-плата и то же ограничение,
     # что и при обычной просрочке (см. scheduler.expire_stale_challenges).
     await db.add_xp(user_id, -settings.missed_day_xp_penalty)
     await db.set_penalty(user_id, settings.penalty_hours)
+
+    # Второй провал подряд - Система останавливается сама (см. failure_policy).
+    await failure_policy.register_failure(user_id)
 
     await challenge_render.close_failed_challenge(
         bot,

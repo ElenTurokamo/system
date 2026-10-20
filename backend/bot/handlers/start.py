@@ -8,7 +8,7 @@ from bot import challenge_render
 from bot import keyboards as kb
 from bot import messages as tx
 from bot import profile
-from bot.config import FOCUS_OPTIONS, time_of_day_label
+from bot.config import FOCUS_OPTIONS, settings, time_of_day_label
 from bot.database import db
 from bot.registration import finish_registration
 from bot.utils import cancel_scheduled_delete, send_command_message
@@ -65,6 +65,11 @@ async def cmd_start(message: Message, bot: Bot):
         resumed = bool(user.get("is_stopped"))
         if resumed:
             await db.set_stopped(message.from_user.id, False)
+            # Если Система была остановлена автоматически (провалов подряд >=
+            # порога), игрок начинает с чистого листа. Ручной /stop после
+            # одного провала счётчик не обнуляет - иначе это лазейка.
+            if (user.get("consecutive_failures") or 0) >= settings.auto_stop_after_failures:
+                await db.reset_failures(message.from_user.id)
 
         # Никаких информационных сообщений - только сама суть: закреплённый профиль
         # и (если сегодняшнее испытание ещё не завершено) трекер испытания дня.
@@ -78,10 +83,17 @@ async def cmd_start(message: Message, bot: Bot):
             await challenge_render.resend_challenge_message(bot, active_challenge["id"])
 
         if resumed:
-            await send_command_message(
-                bot, message.chat.id, "stop",
-                "Система возобновлена ✅ Ежедневные испытания снова будут приходить.",
-            )
+            # Штраф за провал при этом не снимается: пока он действует, новые
+            # испытания не выдаются (см. scheduler._dispatch_for_user).
+            fresh = await db.get_user(message.from_user.id)
+            if db.is_penalty_active(fresh):
+                resume_text = (
+                    "Система возобновлена ✅ Новые испытания начнут приходить "
+                    "после снятия ограничений."
+                )
+            else:
+                resume_text = "Система возобновлена ✅ Ежедневные испытания снова будут приходить."
+            await send_command_message(bot, message.chat.id, "stop", resume_text)
         return
 
     text = (

@@ -126,6 +126,7 @@ A cron job runs for each of the 4 time slots (`TIME_MORNING` / `TIME_DAY` / `TIM
 - A separate job runs every minute and expires any quest older than `CHALLENGE_TIMEOUT_HOURS` (default: 18h) that was never finished, resetting the streak and applying the penalty.
 - **Failure warnings:** the player gets a push 60, 30 and 15 minutes before the quest fails (the previous warning is deleted when the next one arrives, and all of them are removed when the quest closes). In the last 15 minutes the card timer switches to `MM:SS` and refreshes every `CHALLENGE_COUNTDOWN_REFRESH_SECONDS` (default 1).
 - **Penalty pause:** after a failure (timeout or Give Up) no new quests are issued until the penalty timer shown in the profile runs out; skipped slots are simply not dispatched.
+- **Auto-stop:** if the player fails two daily quests in a row (timeout or Give Up, no completed quest in between), the System suspends itself (same state as `/stop`) and stays off until `/start`. A completed quest resets the counter; `/start` after an auto-stop starts from a clean slate. Threshold: `AUTO_STOP_AFTER_FAILURES` (default `2`).
 
 </details>
 
@@ -149,6 +150,7 @@ All configuration lives in `.env` (see `.env.example`):
 | `TIME_MORNING` / `TIME_DAY` / `TIME_EVENING` / `TIME_NIGHT` | Daily dispatch times (`HH:MM`) | `05:00` / `13:00` / `19:00` / `23:00` |
 | `CHALLENGE_TIMEOUT_HOURS` | Hours before an unfinished quest expires | `18` |
 | `PENALTY_HOURS` | Penalty duration after "Give Up" | `48` |
+| `AUTO_STOP_AFTER_FAILURES` | Consecutive failed quests before the System stops itself | `2` |
 | `DB_PATH` | Path to the SQLite file | `/app/data/db.sql` |
 
 ## 🗺️ Roadmap / ideas

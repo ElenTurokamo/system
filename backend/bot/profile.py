@@ -94,6 +94,7 @@ def penalty_block(user: dict) -> str:
         f"В течении следующих {settings.penalty_hours} часов вы не можете:\n\n"
         "* Смотреть контент 18+\n"
         "* Играть в любые видеоигры.\n\n"
+        "⏸ Получение новых испытаний также приостановлено.\n"
         f"⏱️ До снятия ограничений осталось {hours} {hours_label} и {minutes} {minutes_label}."
     )
 

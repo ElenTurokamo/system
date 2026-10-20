@@ -7,6 +7,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot import backup
 from bot import challenge_render
+from bot import failure_policy
 from bot import messages as tx
 from bot import profile
 from bot.config import settings
@@ -38,6 +39,12 @@ async def _dispatch_for_user(bot: Bot, user: dict):
     # пропускаются. Данные берутся из БД заново, а не из списка users, чтобы
     # учесть штраф, наложенный уже после того, как список был получен.
     fresh_user = await db.get_user(user["user_id"]) or user
+
+    # Система могла быть остановлена уже после получения списка users (второй
+    # провал подряд / /stop в эту же секунду) - тогда ничего не выдаём.
+    if fresh_user.get("is_stopped"):
+        return
+
     if db.is_penalty_active(fresh_user):
         logger.info(
             "Испытание не выдано пользователю %s: действует ограничение до %s (UTC)",
@@ -118,6 +125,10 @@ async def _expire_one(bot: Bot, challenge: dict):
     # _dispatch_for_user).
     await db.add_xp(user_id, -settings.missed_day_xp_penalty)
     await db.set_penalty(user_id, settings.penalty_hours)
+
+    # Второй провал подряд - Система останавливается сама (см. failure_policy).
+    # Должно быть до sync_profile_message ниже, чтобы профиль уже показал паузу.
+    await failure_policy.register_failure(user_id)
 
     await challenge_render.close_failed_challenge(
         bot,

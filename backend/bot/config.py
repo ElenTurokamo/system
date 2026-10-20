@@ -30,6 +30,13 @@ class Settings:
         default_factory=lambda: int(_env("MISSED_DAY_XP_PENALTY", "300"))
     )
 
+    # Сколько проваленных ежедневных испытаний ПОДРЯД приводят к автоматической
+    # остановке Системы (см. bot/failure_policy.py). Выполненное испытание
+    # обнуляет счётчик. Минимум 1.
+    auto_stop_after_failures: int = field(
+        default_factory=lambda: max(1, int(_env("AUTO_STOP_AFTER_FAILURES", "2")))
+    )
+
     # Telegram Bot API перестаёт разрешать editMessageText для сообщения по
     # достижении этого возраста (де-факто ограничение платформы, ~48 часов).
     # Профиль - единственное сообщение бота, которое живёт неограниченно долго

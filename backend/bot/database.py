@@ -10,6 +10,9 @@ import aiosqlite
 
 from bot.config import FOCUS_OPTIONS, settings
 
+# Статусы испытания, считающиеся провалом (штрафные).
+FAILED_STATUSES = ("expired", "gave_up")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id         INTEGER PRIMARY KEY,
@@ -23,6 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     level           INTEGER DEFAULT 1,
     streak          INTEGER DEFAULT 0,
     penalty_until   TEXT,
+    consecutive_failures INTEGER DEFAULT 0, -- проваленных испытаний подряд (см. bot/failure_policy.py)
     daily_pushups   INTEGER DEFAULT 0,
     daily_squats    INTEGER DEFAULT 0,
     daily_abs       INTEGER DEFAULT 0,
@@ -149,8 +153,10 @@ class Database:
             "daily_pullups": "INTEGER DEFAULT 0",
             "daily_running": "INTEGER DEFAULT 0",
             "is_stopped": "INTEGER DEFAULT 0",  # /stop - Система приостановлена, дневные квесты не выдаются
+            "consecutive_failures": "INTEGER DEFAULT 0",  # проваленных испытаний подряд (автостоп)
         }
         changed = False
+        backfill_failures = "consecutive_failures" not in existing_users
         for name, col_type in new_user_columns.items():
             if name not in existing_users:
                 await self._conn.execute(f"ALTER TABLE users ADD COLUMN {name} {col_type}")
@@ -194,6 +200,33 @@ class Database:
 
         if changed:
             await self._conn.commit()
+
+        # Колонка consecutive_failures только что добавлена в существующую БД -
+        # восстанавливаем счётчик по истории, чтобы уже накопленный провал не
+        # "забывался" после обновления.
+        if backfill_failures:
+            await self._backfill_consecutive_failures()
+
+    async def _backfill_consecutive_failures(self):
+        cur = await self._conn.execute("SELECT user_id FROM users")
+        user_ids = [row[0] for row in await cur.fetchall()]
+        for user_id in user_ids:
+            cur = await self._conn.execute(
+                "SELECT status FROM challenges WHERE user_id = ? ORDER BY id DESC", (user_id,)
+            )
+            count = 0
+            for (status,) in await cur.fetchall():
+                if status == "awaiting_action":
+                    continue  # ещё не закрыто - ни провал, ни успех
+                if status in FAILED_STATUSES:
+                    count += 1
+                else:
+                    break
+            if count:
+                await self._conn.execute(
+                    "UPDATE users SET consecutive_failures = ? WHERE user_id = ?", (count, user_id)
+                )
+        await self._conn.commit()
 
     async def close(self):
         if self._conn:
@@ -349,6 +382,24 @@ class Database:
         """Ставит/снимает флаг остановки Системы (см. get_users_by_time)."""
         await self._conn.execute(
             "UPDATE users SET is_stopped = ? WHERE user_id = ?", (int(stopped), user_id)
+        )
+        await self._conn.commit()
+
+    async def register_failure(self, user_id: int) -> int:
+        """Атомарно +1 к счётчику проваленных испытаний подряд; возвращает новое значение."""
+        await self._conn.execute(
+            "UPDATE users SET consecutive_failures = COALESCE(consecutive_failures, 0) + 1 "
+            "WHERE user_id = ?",
+            (user_id,),
+        )
+        await self._conn.commit()
+        user = await self.get_user(user_id)
+        return int((user or {}).get("consecutive_failures") or 0)
+
+    async def reset_failures(self, user_id: int):
+        """Обнуляет счётчик провалов подряд (испытание выполнено / Система возобновлена после автостопа)."""
+        await self._conn.execute(
+            "UPDATE users SET consecutive_failures = 0 WHERE user_id = ?", (user_id,)
         )
         await self._conn.commit()
 
@@ -535,12 +586,20 @@ class Database:
         )
         await self._conn.commit()
 
-    async def give_up_challenge(self, challenge_id: int):
-        await self._conn.execute(
-            "UPDATE challenges SET status = 'gave_up', active_focus = NULL, completed_at = ? WHERE id = ?",
+    async def give_up_challenge(self, challenge_id: int) -> bool:
+        """
+        Закрывает испытание как 'gave_up', но ТОЛЬКО если оно всё ещё
+        awaiting_action (защита от двойного нажатия "Да" и от гонки с
+        планировщиком, который в ту же секунду мог его просрочить - иначе
+        штраф и счётчик провалов засчитались бы дважды). True - статус сменился.
+        """
+        cur = await self._conn.execute(
+            "UPDATE challenges SET status = 'gave_up', active_focus = NULL, completed_at = ? "
+            "WHERE id = ? AND status = 'awaiting_action'",
             (datetime.utcnow().isoformat(), challenge_id),
         )
         await self._conn.commit()
+        return cur.rowcount > 0
 
     async def stop_challenge(self, challenge_id: int):
         """
