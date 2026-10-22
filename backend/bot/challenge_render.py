@@ -471,6 +471,13 @@ async def send_challenge_message(bot: Bot, challenge_id: int):
     if not challenge:
         return
 
+    # Первая доставка (message_id ещё пуст): таймаут должен идти с момента, когда
+    # карточка реально дойдёт до игрока, а не с создания строки в БД - при
+    # повторных попытках выдачи (см. bot/dispatch.py) это могут быть часы.
+    if not challenge.get("message_id") and challenge["status"] == "awaiting_action":
+        if await db.restart_challenge_timer(challenge_id):
+            challenge = await db.get_challenge(challenge_id) or challenge
+
     progress_rows = await db.get_progress_rows(challenge_id)
     text = await _build_text(challenge, progress_rows)
     markup = _build_keyboard(challenge, progress_rows)

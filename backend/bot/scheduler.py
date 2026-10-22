@@ -1,5 +1,7 @@
 import asyncio
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -7,6 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot import backup
 from bot import challenge_render
+from bot import dispatch
 from bot import failure_policy
 from bot import messages as tx
 from bot import profile
@@ -17,84 +20,12 @@ logger = logging.getLogger(__name__)
 
 
 async def dispatch_daily_challenges(bot: Bot, time_of_day: str):
-    users = await db.get_users_by_time(time_of_day)
-    for user in users:
-        # Ошибка на одном игроке (заблокировал бота, сбой БД и т.п.) не должна
-        # обрывать рассылку всем остальным в этом слоте.
-        try:
-            await _dispatch_for_user(bot, user)
-        except Exception:
-            logger.exception("Сбой выдачи испытания пользователю %s", user.get("user_id"))
-
-
-async def _dispatch_for_user(bot: Bot, user: dict):
-    # Не создаём новое испытание, если предыдущее ещё не закрыто
-    active = await db.get_active_challenge(user["user_id"])
-    if active:
-        return
-
-    # После провала испытания (таймаут или "Сдаться") на игрока накладывается
-    # ограничение на penalty_hours часов (см. таймер в профиле). Всё это время
-    # новые испытания не выдаются - слоты, попавшие в этот срок, просто
-    # пропускаются. Данные берутся из БД заново, а не из списка users, чтобы
-    # учесть штраф, наложенный уже после того, как список был получен.
-    fresh_user = await db.get_user(user["user_id"]) or user
-
-    # Система могла быть остановлена уже после получения списка users (второй
-    # провал подряд / /stop в эту же секунду) - тогда ничего не выдаём.
-    if fresh_user.get("is_stopped"):
-        return
-
-    if db.is_penalty_active(fresh_user):
-        logger.info(
-            "Испытание не выдано пользователю %s: действует ограничение до %s (UTC)",
-            user["user_id"], fresh_user.get("penalty_until"),
-        )
-        # Профиль всё равно обслуживаем: иначе за 48 часов паузы, пока
-        # диспетчер ничего не трогает, сообщение профиля могло бы "состариться"
-        # настолько, что Telegram перестанет давать его редактировать.
-        try:
-            await profile.ensure_fresh_profile_message(bot, user["user_id"])
-        except Exception:
-            logger.exception("Не удалось обновить профиль пользователя %s", user["user_id"])
-        return
-    user = fresh_user
-
-    focuses = await db.get_focuses(user["user_id"])
-    if not focuses:
-        return
-
-    # Новый ежедневный квест выдаётся - удаляем отчёт о вчерашнем провале
-    # (если он был), чтобы он не копился в чате.
-    await profile.clear_failure_message(bot, user)
-
-    quest_text = tx.challenge_start(
-        streak=user["streak"],
-        level=user["level"],
-        xp=user["xp"],
-        timeout=settings.challenge_timeout_hours,
-    )
-    challenge_id = await db.create_challenge(user["user_id"], quest_text, focuses)
-
-    # Профиль обновляется ПЕРЕД отправкой карточки испытания, а не после -
-    # так в чате профиль всегда оказывается выше нового квеста, а не
-    # наоборот (испытание создано в БД строкой выше, поэтому отметка
-    # "Вы выполнили сегодняшний квест" в профиле уже корректно исчезает).
-    #
-    # Именно здесь (а не отдельной фоновой джобой) профиль ещё и
-    # ПЕРЕСОЗДАЁТСЯ, если это нужно (см. profile.ensure_fresh_profile_message) -
-    # так пересоздание не может случиться чаще раза в день и происходит
-    # только в момент выдачи квеста, во время, которое сам игрок задал.
-    try:
-        await profile.ensure_fresh_profile_message(bot, user["user_id"])
-    except Exception:
-        # Сбой профиля не должен лишать игрока карточки уже созданного квеста.
-        logger.exception("Не удалось обновить профиль перед выдачей испытания %s", user["user_id"])
-
-    try:
-        await challenge_render.send_challenge_message(bot, challenge_id)
-    except Exception as e:
-        logger.warning("Не удалось отправить испытание пользователю %s: %s", user["user_id"], e)
+    """
+    Cron-задача слота: первая попытка выдачи ежедневного квеста каждому игроку
+    слота. Вся логика (проверка "нужна ли выдача", повторы раз в час, пропуск до
+    следующего дня, учёт /stop и блокировки бота) - в bot/dispatch.py.
+    """
+    await dispatch.dispatch_slot(bot, time_of_day)
 
 
 async def expire_stale_challenges(bot: Bot):
@@ -122,7 +53,7 @@ async def _expire_one(bot: Bot, challenge: dict):
     # которое отображается в профиле (см. bot/profile.py::penalty_block)
     # и само обновляется там каждую минуту (см. refresh_penalty_profiles).
     # Пока ограничение действует, новые испытания не выдаются (см.
-    # _dispatch_for_user).
+    # dispatch._process_locked).
     await db.add_xp(user_id, -settings.missed_day_xp_penalty)
     await db.set_penalty(user_id, settings.penalty_hours)
 
@@ -242,7 +173,29 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
             args=[bot, time_of_day],
             id=f"dispatch_{time_of_day}",
             replace_existing=True,
+            # По умолчанию misfire_grace_time = 1 с: если event loop в момент слота
+            # был занят, APScheduler молча пропускал бы весь слот. Даём запас; если
+            # слот всё же потерян - его досылает reconcile_dispatches.
+            misfire_grace_time=300,
+            coalesce=True,
+            max_instances=1,
         )
+
+    # Проверка по таймеру, ДОСТАВЛЕН ли ежедневный квест (см. bot/dispatch.py):
+    # повторные попытки раз в час (до DISPATCH_RETRY_ATTEMPTS раз) по тем, кому
+    # карточка не дошла, и досылка слотов, в которые cron не отработал (бот был
+    # выключен/перезапускался). Первый запуск - сразу при старте бота.
+    scheduler.add_job(
+        dispatch.reconcile_dispatches,
+        "interval",
+        minutes=1,
+        args=[bot],
+        id="dispatch_reconcile",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(ZoneInfo(settings.tz)),
+    )
 
     # Проверка просроченных испытаний - раз в минуту (раньше было раз в 15
     # минут). Теперь таймер в карточке доходит до 00:00, и игрок видит это

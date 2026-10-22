@@ -37,6 +37,28 @@ class Settings:
         default_factory=lambda: max(1, int(_env("AUTO_STOP_AFTER_FAILURES", "2")))
     )
 
+    # ---------- Отказоустойчивость ежедневной выдачи (bot/dispatch.py) ----------
+    # Сколько ПОВТОРНЫХ попыток доставить карточку квеста делается после
+    # неудачной первой (в момент слота). По умолчанию 3: слот, +1ч, +2ч, +3ч.
+    # После последней неудачной попытки игрок пропускается до следующего дня.
+    dispatch_retry_attempts: int = field(
+        default_factory=lambda: max(0, int(_env("DISPATCH_RETRY_ATTEMPTS", "3")))
+    )
+    # Шаг между попытками (минуты). По умолчанию - час.
+    dispatch_retry_interval_minutes: int = field(
+        default_factory=lambda: max(1, int(_env("DISPATCH_RETRY_INTERVAL_MINUTES", "60")))
+    )
+    # Если бот был выключен/перезапущен в момент слота (cron-задача не
+    # сработала вообще), выдача досылается при старте, но только пока с момента
+    # слота прошло не больше стольких минут. Позже - день пропускается.
+    dispatch_catchup_window_minutes: int = field(
+        default_factory=lambda: max(0, int(_env("DISPATCH_CATCHUP_WINDOW_MINUTES", "180")))
+    )
+    # Сколько дней хранится журнал выдач (таблица dispatch_log).
+    dispatch_log_retention_days: int = field(
+        default_factory=lambda: max(7, int(_env("DISPATCH_LOG_RETENTION_DAYS", "90")))
+    )
+
     # Telegram Bot API перестаёт разрешать editMessageText для сообщения по
     # достижении этого возраста (де-факто ограничение платформы, ~48 часов).
     # Профиль - единственное сообщение бота, которое живёт неограниченно долго

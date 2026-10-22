@@ -73,6 +73,7 @@ solo_bot/
 │   ├── database.py        # aiosqlite layer + schema
 │   ├── keyboards.py        # inline keyboards
 │   ├── messages.py         # System-voice message generator
+│   ├── dispatch.py         # fault-tolerant daily delivery: retries, catch-up, skip rules
 │   ├── scheduler.py        # APScheduler jobs
 │   ├── states.py           # FSM states for onboarding
 │   └── handlers/
@@ -127,6 +128,7 @@ A cron job runs for each of the 4 time slots (`TIME_MORNING` / `TIME_DAY` / `TIM
 - **Failure warnings:** the player gets a push 60, 30 and 15 minutes before the quest fails (the previous warning is deleted when the next one arrives, and all of them are removed when the quest closes). In the last 15 minutes the card timer switches to `MM:SS` and refreshes every `CHALLENGE_COUNTDOWN_REFRESH_SECONDS` (default 1).
 - **Penalty pause:** after a failure (timeout or Give Up) no new quests are issued until the penalty timer shown in the profile runs out; skipped slots are simply not dispatched.
 - **Auto-stop:** if the player fails two daily quests in a row (timeout or Give Up, no completed quest in between), the System suspends itself (same state as `/stop`) and stays off until `/start`. A completed quest resets the counter; `/start` after an auto-stop starts from a clean slate. Threshold: `AUTO_STOP_AFTER_FAILURES` (default `2`).
+- **Delivery fault tolerance:** a quest only counts as issued once its card actually reaches the player (`bot/dispatch.py`, journal in the `dispatch_log` table). If sending fails, the bot retries every `DISPATCH_RETRY_INTERVAL_MINUTES` (60) up to `DISPATCH_RETRY_ATTEMPTS` (3) times — slot, +1h, +2h, +3h — and then skips the player until the next day; the undelivered card is removed and never penalizes the player (the timeout is counted from the moment of real delivery). No retries are made if the player switched the System off: `/stop` or auto-stop (also between attempts), a blocked bot (marked unreachable immediately), or a changed quest time. A check runs every minute; if the slot's cron did not fire at all (bot was down or restarted), quests are sent late within `DISPATCH_CATCHUP_WINDOW_MINUTES` (180) of the slot, only to players registered before the slot.
 
 </details>
 
@@ -151,6 +153,9 @@ All configuration lives in `.env` (see `.env.example`):
 | `CHALLENGE_TIMEOUT_HOURS` | Hours before an unfinished quest expires | `18` |
 | `PENALTY_HOURS` | Penalty duration after "Give Up" | `48` |
 | `AUTO_STOP_AFTER_FAILURES` | Consecutive failed quests before the System stops itself | `2` |
+| `DISPATCH_RETRY_ATTEMPTS` | Retries after a failed quest delivery (then the player is skipped until the next day) | `3` |
+| `DISPATCH_RETRY_INTERVAL_MINUTES` | Step between delivery attempts | `60` |
+| `DISPATCH_CATCHUP_WINDOW_MINUTES` | How long after a slot a missed (cron did not fire) delivery is still sent | `180` |
 | `DB_PATH` | Path to the SQLite file | `/app/data/db.sql` |
 
 ## 🗺️ Roadmap / ideas

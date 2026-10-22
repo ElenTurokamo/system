@@ -119,6 +119,42 @@ CREATE TABLE IF NOT EXISTS challenge_cheers (
     created_at      TEXT,
     UNIQUE(challenge_id, supporter_id)
 );
+
+-- Журнал ежедневной выдачи квестов (см. bot/dispatch.py): по одной строке на
+-- игрока, локальный день (по TZ) и слот. Именно по ней бот понимает, было ли
+-- сообщение с квестом реально доставлено, и когда делать следующую попытку.
+--   pending     - доставка не удалась, ждёт повторной попытки (next_attempt_at)
+--   delivered   - карточка квеста доставлена
+--   skipped     - выдача не требовалась (Система остановлена, штраф, нет дисциплин...)
+--   failed      - все попытки исчерпаны, игрок пропущен до следующего дня
+--   unreachable - бот заблокирован игроком / чат недоступен, повторять бессмысленно
+CREATE TABLE IF NOT EXISTS dispatch_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    day             TEXT NOT NULL,       -- YYYY-MM-DD, локальная дата слота по TZ
+    slot            TEXT NOT NULL,       -- morning / day / evening / night
+    status          TEXT NOT NULL,
+    reason          TEXT,
+    attempts        INTEGER DEFAULT 0,   -- сколько раз реально пытались отправить карточку
+    last_attempt_at TEXT,                -- UTC
+    next_attempt_at TEXT,                -- UTC, только для pending
+    last_error      TEXT,
+    created_at      TEXT,
+    updated_at      TEXT,
+    UNIQUE(user_id, day, slot)
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_log_pending ON dispatch_log(status, next_attempt_at);
+
+-- Какие слоты (день + слот) диспетчер уже ОБОШЁЛ целиком. Если запись отсутствует
+-- спустя пару минут после слота - значит cron не сработал (бот был выключен,
+-- перезапускался, процесс убили посреди рассылки), и reconcile досылает квесты
+-- (см. dispatch.catch_up_missed_dispatches).
+CREATE TABLE IF NOT EXISTS dispatch_runs (
+    day             TEXT NOT NULL,
+    slot            TEXT NOT NULL,
+    finished_at     TEXT,
+    PRIMARY KEY (day, slot)
+);
 """
 
 
@@ -133,6 +169,7 @@ class Database:
         await self._conn.executescript(SCHEMA)
         await self._conn.commit()
         await self._migrate()
+        await self.prune_dispatch_log(settings.dispatch_log_retention_days)
 
     async def _migrate(self):
         """Добавляет новые колонки в уже существующие БД, не трогая данные."""
@@ -619,17 +656,27 @@ class Database:
 
     async def get_awaiting_challenges(self) -> list[dict]:
         """Все испытания, которые сейчас активны (карточка ждёт действий игрока)."""
+        # message_id IS NOT NULL: карточка, которая так и не дошла до игрока
+        # (см. bot/dispatch.py), не должна ни обновляться таймером, ни слать
+        # предупреждения о провале.
         cur = await self._conn.execute(
-            "SELECT * FROM challenges WHERE status = 'awaiting_action'"
+            "SELECT * FROM challenges WHERE status = 'awaiting_action' AND message_id IS NOT NULL"
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
     async def get_expirable_challenges(self, timeout_hours: int) -> list[dict]:
+        """
+        Активные испытания, у которых вышел таймаут. Только ДОСТАВЛЕННЫЕ
+        (message_id задан): если карточка не дошла до игрока из-за сбоя
+        отправки, то игрок квеста не видел и штрафовать его нельзя - такими
+        занимается bot/dispatch.py (повторные попытки или удаление).
+        """
         cutoff = (datetime.utcnow() - timedelta(hours=timeout_hours)).isoformat()
         cur = await self._conn.execute(
             """SELECT * FROM challenges
                WHERE status = 'awaiting_action'
+               AND message_id IS NOT NULL
                AND started_at < ?""",
             (cutoff,),
         )
@@ -653,6 +700,141 @@ class Database:
         )
         await self._conn.commit()
         return cur.rowcount > 0
+
+    async def restart_challenge_timer(self, challenge_id: int) -> bool:
+        """
+        Перезапускает отсчёт таймаута (started_at = сейчас) для ещё НЕ
+        доставленного испытания (message_id пуст). Нужно, чтобы игрок получал
+        полные CHALLENGE_TIMEOUT_HOURS с момента, когда карточка реально до него
+        дошла, а не с момента создания строки в БД (при повторных попытках
+        это может быть на несколько часов раньше).
+        """
+        cur = await self._conn.execute(
+            "UPDATE challenges SET started_at = ? "
+            "WHERE id = ? AND status = 'awaiting_action' AND message_id IS NULL",
+            (datetime.utcnow().isoformat(), challenge_id),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    async def delete_undelivered_challenge(self, challenge_id: int) -> bool:
+        """
+        Полностью удаляет испытание, которое так и не было доставлено игроку
+        (awaiting_action и message_id пуст), вместе со строками прогресса.
+        Условие в UPDATE/DELETE защищает от гонки: доставленную карточку или
+        уже закрытое испытание эта операция не тронет.
+        """
+        cur = await self._conn.execute(
+            "DELETE FROM challenges "
+            "WHERE id = ? AND status = 'awaiting_action' AND message_id IS NULL",
+            (challenge_id,),
+        )
+        deleted = cur.rowcount > 0
+        if deleted:
+            await self._conn.execute(
+                "DELETE FROM challenge_progress WHERE challenge_id = ?", (challenge_id,)
+            )
+            await self._conn.execute(
+                "DELETE FROM challenge_cheers WHERE challenge_id = ?", (challenge_id,)
+            )
+        await self._conn.commit()
+        return deleted
+
+    async def has_challenge_since(self, user_id: int, since_utc_iso: str) -> bool:
+        """Было ли у игрока испытание, созданное не раньше указанного момента (UTC)."""
+        cur = await self._conn.execute(
+            "SELECT 1 FROM challenges WHERE user_id = ? AND started_at >= ? LIMIT 1",
+            (user_id, since_utc_iso),
+        )
+        return (await cur.fetchone()) is not None
+
+    # ---------- журнал ежедневной выдачи (bot/dispatch.py) ----------
+
+    async def get_users_in_slot(self, time_of_day: str) -> list[dict]:
+        """
+        ВСЕ зарегистрированные игроки слота, включая остановленных (/stop или
+        автостоп): для них диспетчер пишет в журнал запись "skipped", чтобы
+        возобновление Системы посреди дня не приводило к запоздалой выдаче.
+        """
+        cur = await self._conn.execute(
+            "SELECT * FROM users WHERE time_of_day = ? AND reg_state = 'done'", (time_of_day,)
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def is_slot_run_finished(self, day: str, slot: str) -> bool:
+        cur = await self._conn.execute(
+            "SELECT 1 FROM dispatch_runs WHERE day = ? AND slot = ? AND finished_at IS NOT NULL",
+            (day, slot),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def mark_slot_run_finished(self, day: str, slot: str):
+        await self._conn.execute(
+            "INSERT INTO dispatch_runs (day, slot, finished_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(day, slot) DO UPDATE SET finished_at = excluded.finished_at",
+            (day, slot, datetime.utcnow().isoformat()),
+        )
+        await self._conn.commit()
+
+    async def get_dispatch(self, user_id: int, day: str, slot: str) -> Optional[dict]:
+        cur = await self._conn.execute(
+            "SELECT * FROM dispatch_log WHERE user_id = ? AND day = ? AND slot = ?",
+            (user_id, day, slot),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def save_dispatch(
+        self,
+        user_id: int,
+        day: str,
+        slot: str,
+        status: str,
+        *,
+        reason: Optional[str] = None,
+        attempts: int = 0,
+        last_attempt_at: Optional[str] = None,
+        next_attempt_at: Optional[str] = None,
+        last_error: Optional[str] = None,
+    ):
+        """Создаёт или перезаписывает запись журнала (одна на игрока/день/слот)."""
+        now = datetime.utcnow().isoformat()
+        await self._conn.execute(
+            """INSERT INTO dispatch_log
+                   (user_id, day, slot, status, reason, attempts, last_attempt_at,
+                    next_attempt_at, last_error, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, day, slot) DO UPDATE SET
+                   status = excluded.status,
+                   reason = excluded.reason,
+                   attempts = excluded.attempts,
+                   last_attempt_at = excluded.last_attempt_at,
+                   next_attempt_at = excluded.next_attempt_at,
+                   last_error = excluded.last_error,
+                   updated_at = excluded.updated_at""",
+            (
+                user_id, day, slot, status, reason, attempts, last_attempt_at,
+                next_attempt_at, (last_error or "")[:300] or None, now, now,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_due_pending_dispatches(self, now_utc_iso: str) -> list[dict]:
+        """Записи в статусе pending, у которых подошло время повторной попытки."""
+        cur = await self._conn.execute(
+            "SELECT * FROM dispatch_log WHERE status = 'pending' "
+            "AND next_attempt_at IS NOT NULL AND next_attempt_at <= ? ORDER BY next_attempt_at ASC",
+            (now_utc_iso,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def prune_dispatch_log(self, keep_days: int):
+        cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
+        await self._conn.execute("DELETE FROM dispatch_log WHERE updated_at < ?", (cutoff,))
+        await self._conn.execute("DELETE FROM dispatch_runs WHERE finished_at < ?", (cutoff,))
+        await self._conn.commit()
 
     # ---------- предупреждения о скором провале ----------
 

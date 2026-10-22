@@ -84,7 +84,7 @@ async def cmd_start(message: Message, bot: Bot):
 
         if resumed:
             # Штраф за провал при этом не снимается: пока он действует, новые
-            # испытания не выдаются (см. scheduler._dispatch_for_user).
+            # испытания не выдаются (см. bot/dispatch.py).
             fresh = await db.get_user(message.from_user.id)
             if db.is_penalty_active(fresh):
                 resume_text = (
@@ -218,7 +218,7 @@ async def cmd_stop(message: Message, bot: Bot):
     """
     /stop - полностью останавливает Систему для игрока: ежедневные испытания
     больше не создаются и не рассылаются (см. db.get_users_by_time, которая
-    пропускает пользователей с is_stopped=1 в scheduler.dispatch_daily_challenges),
+    пропускает пользователей с is_stopped=1 в bot/dispatch.py),
     пока игрок не введёт /start заново (см. cmd_start выше - там же снимается
     остановка).
 
@@ -264,7 +264,10 @@ async def on_stop_system_confirmed(call: CallbackQuery):
     active_challenge = await db.get_active_challenge(user_id)
     if active_challenge:
         await db.stop_challenge(active_challenge["id"])
-        await db.record_daily_stats(active_challenge["id"])
+        # Карточка, которая так и не дошла до игрока (сбой отправки, ждёт повторной
+        # попытки - см. bot/dispatch.py), в статистику нулевым днём не попадает.
+        if active_challenge.get("message_id"):
+            await db.record_daily_stats(active_challenge["id"])
         # Предупреждение "до провала осталось..." после остановки Системы неактуально.
         await challenge_render.clear_warning_message(call.bot, active_challenge["id"])
         if active_challenge.get("message_id"):
