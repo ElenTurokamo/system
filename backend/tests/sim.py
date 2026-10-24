@@ -50,9 +50,15 @@ def retry_after(sec=1):
     return TelegramRetryAfter(method=_method(), message="Flood control", retry_after=sec)
 
 
+class _Doc:
+    def __init__(self, file_id):
+        self.file_id = file_id
+
+
 class Msg:
-    def __init__(self, message_id):
+    def __init__(self, message_id, document=None):
         self.message_id = message_id
+        self.document = document
 
 
 class FakeBot:
@@ -94,6 +100,21 @@ class FakeBot:
                 await self.on_card_sent(chat_id)
         return Msg(self._id)
 
+    async def send_document(self, chat_id, document, caption=None, **kw):
+        """Документ (PDF-гайд). Хранит, ЧТО именно передали: str - это file_id, иначе файл с диска."""
+        self._check("send_document", chat_id, {"document": document, **kw})
+        self._id += 1
+        self.alive[(chat_id, self._id)] = caption or ""
+        self.log.append(("send_document", chat_id, {"document": document, "caption": caption, **kw}))
+        return Msg(self._id, document=_Doc("FAKE_FILE_ID"))
+
+    async def send_photo(self, chat_id, photo, caption=None, **kw):
+        self._check("send_photo", chat_id, {"photo": photo, **kw})
+        self._id += 1
+        self.alive[(chat_id, self._id)] = caption or ""
+        self.log.append(("send_photo", chat_id, {"photo": photo, "caption": caption, **kw}))
+        return Msg(self._id)
+
     async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
         self._check("edit_message_text", chat_id, kw)
         self.log.append(("edit_message_text", chat_id, {"text": text, "message_id": message_id}))
@@ -122,6 +143,10 @@ class FakeBot:
     # --- удобные запросы для проверок ---
     def cards_alive(self, chat_id):
         return [k for k in self.card_ids if k in self.alive and k[0] == chat_id]
+
+    def sent(self, method, chat_id):
+        """Все вызовы метода в чат: список kwargs (для send_message там есть 'text')."""
+        return [kw for (m, cid, kw) in self.log if m == method and cid == chat_id]
 
     def card_attempt_count(self, chat_id):
         return len([a for a in self.card_attempts if a[0] == chat_id])
@@ -211,6 +236,13 @@ def fresh_modules():
     dispatch._slot_runs_in_progress.clear()
     import bot.profile as profile
     profile._profile_locks.clear()
+    import bot.guide as guide
+    guide._file_id = None
+    import bot.utils as utils
+    utils._command_messages.clear()
+    for task in list(utils._delete_tasks.values()):
+        task.cancel()
+    utils._delete_tasks.clear()
     import bot.challenge_render as cr
     cr._giveup_confirm_until.clear()
     cr._flood_until.clear()

@@ -79,6 +79,8 @@ solo_bot/
 │   ├── messages.py         # System-voice message generator
 │   ├── dispatch.py         # fault-tolerant daily delivery: retries, catch-up, skip rules
 │   ├── scheduler.py        # APScheduler jobs
+│   ├── completion.py       # quest completion (button + auto-finish on timeout)
+│   ├── guide.py            # PDF guide (/help + registration)
 │   ├── states.py           # FSM states for onboarding
 │   └── handlers/
 │       ├── start.py        # /start, onboarding flow
@@ -86,7 +88,8 @@ solo_bot/
 │       ├── challenge.py    # daily quest logic
 │       └── misc.py         # /profile, /help
 ├── data/
-│   └── messages.json       # message fragment bank
+│   ├── messages.json       # message fragment bank
+│   └── guide.pdf           # player guide (sent with /help and at registration)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -132,12 +135,22 @@ A cron job runs for each of the 4 time slots (`TIME_MORNING` / `TIME_DAY` / `TIM
 - The **day's challenge only completes once every focus has hit its target** (or the player gives up) — reaching one goal doesn't end the challenge by itself.
 - **🏳 Give Up** resets the streak, applies the 48h penalty, and closes the message (keyboard removed).
 - A separate job runs every minute and expires (edits + closes) any quest older than `CHALLENGE_TIMEOUT_HOURS` (default: 18h) that was never finished, resetting the streak and applying the penalty.
+- **Forgot to press "Finish"?** When the timeout hits, the quest is *not* failed if every discipline is already closed: it is completed automatically (XP, streak, daily stats, reset of the failure counter - exactly like the button), and a text report (`Отчёт дня N. Игрок … завершил испытание.`, plus the secret-quest line if earned) is posted to the bound group **without a photo**. If the photo report already reached the group, no second message is sent. The profile shows the quest (and the secret quest) as done. Check and status change are one atomic SQL `UPDATE` (`Database.complete_challenge_if_ready`), so the button, the timeout and Give Up can never both apply. Code: `bot/completion.py`.
 - **Failure warnings:** the player gets a push 60, 30 and 15 minutes before the quest fails (the previous warning is deleted when the next one arrives, and all of them are removed when the quest closes). In the last 15 minutes the card timer switches to `MM:SS` and refreshes every `CHALLENGE_COUNTDOWN_REFRESH_SECONDS` (default 1).
 - **Penalty pause:** after a failure (timeout or Give Up) no new quests are issued until the penalty timer shown in the profile runs out; skipped slots are simply not dispatched.
 - **Auto-stop:** if the player fails two daily quests in a row (timeout or Give Up, no completed quest in between), the System suspends itself (same state as `/stop`) and stays off until `/start`. A completed quest resets the counter; `/start` after an auto-stop starts from a clean slate. Threshold: `AUTO_STOP_AFTER_FAILURES` (default `2`).
 - **Delivery fault tolerance:** a quest only counts as issued once its card actually reaches the player (`bot/dispatch.py`, journal in the `dispatch_log` table). If sending fails, the bot retries every `DISPATCH_RETRY_INTERVAL_MINUTES` (60) up to `DISPATCH_RETRY_ATTEMPTS` (3) times — slot, +1h, +2h, +3h — and then skips the player until the next day; the undelivered card is removed and never penalizes the player (the timeout is counted from the moment of real delivery). No retries are made if the player switched the System off: `/stop` or auto-stop (also between attempts), a blocked bot (marked unreachable immediately), or a changed quest time. A check runs every minute; if the slot's cron did not fire at all (bot was down or restarted), quests are sent late within `DISPATCH_CATCHUP_WINDOW_MINUTES` (180) of the slot, only to players registered before the slot.
 
 **Secret x2 bonus:** this isn't advertised anywhere in the UI. If a player pushes a single focus to `target × 2` (e.g. 100 push-ups when the goal was 50), the bot fires a one-off "hidden protocol detected" message and instantly grants `+5 levels`. That focus is then **sealed** (`✅🔒`) for the rest of the day — it can't be selected again, so the bonus can't be farmed twice on the same discipline.
+
+</details>
+
+<details>
+<summary><strong>PDF guide</strong></summary>
+
+<br>
+
+`data/guide.pdf` (player guide) is sent (a) together with `/help` - one message: the PDF with the command list as its caption (auto-deleted after 5 minutes, falls back to plain text if the file is missing or Telegram fails), and (b) once at the very start of registration, above the first step (flag `users.guide_sent`, so a repeated `/start` during registration does not resend it). The first upload caches Telegram's `file_id` in memory. To update the guide, replace `data/guide.pdf` and restart the bot. Code: `bot/guide.py`.
 
 </details>
 

@@ -11,6 +11,13 @@ from tests import sim
 from tests.sim import Clock, net_error
 
 
+# id испытаний, которые сам фаззер закрыл напрямую (минуя прогресс) - для инварианта I11.
+_DIRECTLY_COMPLETED: set[int] = set()
+# id испытаний, где игрок закрыл все цели, но "Завершить" не нажал: фаззер сам их не закрывает,
+# их должно подобрать авто-завершение по таймауту (если раньше не сработал /stop).
+_FORGOT_TO_FINISH: set[int] = set()
+
+
 async def _check_invariants(s, uid_slots):
     db = s.db
     q = db._conn.execute
@@ -28,6 +35,22 @@ async def _check_invariants(s, uid_slots):
     cur = await q("SELECT id FROM challenges WHERE status IN ('expired','gave_up') AND message_id IS NULL")
     assert not await cur.fetchall(), "I4: оштрафовано испытание, которое игрок не получал"
 
+    # I10: просроченным (с штрафом) не может оказаться испытание, у которого ВСЕ цели
+    # закрыты - такое должно быть авто-завершено (см. bot/completion.py).
+    cur = await q("SELECT id FROM challenges WHERE status='expired'")
+    for row in await cur.fetchall():
+        c2 = await q("SELECT COUNT(*) n, SUM(completed) done FROM challenge_progress WHERE challenge_id=?", (row["id"],))
+        r = await c2.fetchone()
+        assert not (r["n"] and r["n"] == r["done"]), f"I10: испытание {row['id']} просрочено при всех закрытых целях"
+
+    # I11: у выполненных испытаний все цели закрыты (авто-завершение не засчитывает недоделанное).
+    cur = await q("SELECT id FROM challenges WHERE status IN ('completed','completed_with_photo')")
+    for row in await cur.fetchall():
+        c2 = await q("SELECT COUNT(*) n, SUM(completed) done FROM challenge_progress WHERE challenge_id=?", (row["id"],))
+        r = await c2.fetchone()
+        if r["n"]:  # испытания, закрытые напрямую через db.complete_challenge в самом фаззере, строк прогресса не трогают
+            assert r["n"] == (r["done"] or 0) or row["id"] in _DIRECTLY_COMPLETED, f"I11: {row['id']} выполнено без закрытых целей"
+
     if not (s.cron_down):
         stuck = (Clock.now - timedelta(minutes=3)).isoformat()
         cur = await q("SELECT * FROM dispatch_log WHERE status='pending' AND next_attempt_at < ?", (stuck,))
@@ -35,6 +58,8 @@ async def _check_invariants(s, uid_slots):
 
 
 async def _scenario(s, seed, days=3):
+    _DIRECTLY_COMPLETED.clear()
+    _FORGOT_TO_FINISH.clear()
     rnd = random.Random(seed)
     Clock.now = datetime(2026, 10, 22, 0, 0)
     slots = ["morning", "day", "evening", "night"]
@@ -81,8 +106,16 @@ async def _scenario(s, seed, days=3):
                 await s.db.set_stopped(u, False)
             elif r < 0.0070:                      # выполнил квест
                 a = await s.db.get_active_challenge(u)
-                if a and a.get("message_id"):
+                if a and a.get("message_id") and a["id"] not in _FORGOT_TO_FINISH:
                     await s.db.complete_challenge(a["id"], False)
+                    _DIRECTLY_COMPLETED.add(a["id"])
+            elif r < 0.0100:                      # закрыл ВСЕ цели, но "Завершить" не нажал
+                a = await s.db.get_active_challenge(u)
+                if a and a.get("message_id") and a["id"] not in _FORGOT_TO_FINISH:
+                    _FORGOT_TO_FINISH.add(a["id"])
+                    for p in await s.db.get_progress_rows(a["id"]):
+                        await s.db.add_progress_amount(a["id"], p["focus"], p["target"])
+                        await s.db.sync_progress_completed(a["id"], p["focus"])
         if down_until is None and rnd.random() < 0.0012:
             down_until = Clock.now + timedelta(minutes=rnd.choice([5, 15, 90, 200, 400]))
             s.cron_down = rnd.random() < 0.5

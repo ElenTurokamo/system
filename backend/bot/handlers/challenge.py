@@ -2,6 +2,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, Message
 
 from bot import challenge_render
+from bot import completion
 from bot import failure_policy
 from bot import messages as tx
 from bot import profile
@@ -169,19 +170,12 @@ async def on_finish_challenge(call: CallbackQuery):
         await call.answer("Ещё не все цели дня выполнены.", show_alert=True)
         return
 
-    user = await db.get_user(call.from_user.id)
-    reward = xp_reward_for_challenge(user["level"])
-
-    await db.set_active_focus(challenge_id, None)
-    await db.add_xp(call.from_user.id, reward)
-    await db.increment_streak(call.from_user.id)
-    # Выполненное испытание прерывает серию провалов подряд (см. failure_policy).
-    await db.reset_failures(call.from_user.id)
-    await db.complete_challenge(challenge_id, with_photo=bool(challenge["physical_photo_posted"]))
-    await db.record_daily_stats(challenge_id)
-
-    await challenge_render.push_challenge_update(call.bot, challenge_id)
-    await profile.sync_profile_message(call.bot, call.from_user.id)
+    # Награда и закрытие - в общем модуле (его же использует авто-завершение по
+    # таймауту): атомарный условный UPDATE не даст начислить её дважды, если
+    # кнопку нажали в ту же секунду, что сработал таймаут/"Сдаться".
+    if not await completion.complete_challenge_flow(call.bot, challenge, auto=False):
+        await call.answer("Испытание уже неактуально.", show_alert=True)
+        return
     await call.answer()
 
 

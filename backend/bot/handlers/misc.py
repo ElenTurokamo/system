@@ -2,7 +2,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from bot import profile
+from bot import guide, profile
 from bot.database import db
 from bot.utils import send_command_message
 
@@ -41,19 +41,8 @@ async def cmd_profile(message: Message, bot: Bot):
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, bot: Bot):
-    await send_command_message(
-        bot, message.chat.id, "help",
-        "/start — регистрация\n"
-        "/profile — обновить и показать закреплённую сводку профиля\n"
-        "/change_time — сменить время ежедневного испытания\n"
-        "/change_focus — сменить дисциплины испытаний\n"
-        "/stop — остановить Систему (ежедневные испытания перестанут приходить)\n"
-        "/get_stats_excel — скачать статистику прокачки в Excel\n"
-        "/add_friend — добавить друга по его коду игрока\n"
-        "/friendlist — список друзей и их прогресс\n"
-        "/bind_group — привязать текущую группу (вызывать внутри группы)\n"
-        "/group_id — узнать ID текущей группы"
-    )
+    # Список команд + PDF-гайд одним сообщением (при сбое - обычный текст), см. bot/guide.py.
+    await guide.send_help(bot, message.chat.id)
 
 
 @router.message(F.chat.type == "private")

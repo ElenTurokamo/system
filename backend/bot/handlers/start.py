@@ -5,6 +5,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 from bot import challenge_render
+from bot import guide
 from bot import keyboards as kb
 from bot import messages as tx
 from bot import profile
@@ -95,6 +96,10 @@ async def cmd_start(message: Message, bot: Bot):
                 resume_text = "Система возобновлена ✅ Ежедневные испытания снова будут приходить."
             await send_command_message(bot, message.chat.id, "stop", resume_text)
         return
+
+    # Первый запуск: PDF-гайд приходит один раз и ВЫШЕ первого шага регистрации
+    # (шаг с кнопками остаётся последним сообщением в чате). Сбой гайда регистрацию не ломает.
+    await guide.send_registration_guide(bot, message.from_user.id)
 
     text = (
         f"{tx.registration_welcome()}\n\n"

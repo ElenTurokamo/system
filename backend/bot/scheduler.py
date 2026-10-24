@@ -9,6 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot import backup
 from bot import challenge_render
+from bot import completion
 from bot import dispatch
 from bot import failure_policy
 from bot import messages as tx
@@ -39,6 +40,13 @@ async def expire_stale_challenges(bot: Bot):
 
 async def _expire_one(bot: Bot, challenge: dict):
     user_id = challenge["user_id"]
+
+    # Время вышло, но все цели дня закрыты - игрок просто забыл нажать "Завершить
+    # испытание". Это не провал: испытание засчитывается как выполненное (XP, серия,
+    # статистика, отчёт в группу без фото - см. bot/completion.py). Проверка и смена
+    # статуса атомарны: если игрок успел нажать кнопку/сдаться - вернётся False.
+    if await completion.complete_challenge_flow(bot, challenge, auto=True):
+        return
 
     # Условный UPDATE: если игрок успел завершить/сдать испытание, пока мы
     # разбирали список, - ничего не штрафуем (см. Database.expire_challenge).

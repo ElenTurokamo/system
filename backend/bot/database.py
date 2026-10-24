@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS users (
     profile_chat_id     INTEGER,         -- чат, где закреплена сводка профиля
     profile_message_id  INTEGER,         -- id закреплённого сообщения-сводки
     failure_chat_id      INTEGER,        -- чат последнего сообщения-отчёта о провале испытания
-    failure_message_id   INTEGER         -- id последнего сообщения-отчёта о провале (удаляется при новом квесте)
+    failure_message_id   INTEGER,        -- id последнего сообщения-отчёта о провале (удаляется при новом квесте)
+    guide_sent           INTEGER DEFAULT 0  -- PDF-гайд уже отправлен при регистрации (см. bot/guide.py)
 );
 
 CREATE TABLE IF NOT EXISTS challenges (
@@ -191,6 +192,7 @@ class Database:
             "daily_running": "INTEGER DEFAULT 0",
             "is_stopped": "INTEGER DEFAULT 0",  # /stop - Система приостановлена, дневные квесты не выдаются
             "consecutive_failures": "INTEGER DEFAULT 0",  # проваленных испытаний подряд (автостоп)
+            "guide_sent": "INTEGER DEFAULT 0",  # PDF-гайд уже отправлен при регистрации (см. bot/guide.py)
         }
         changed = False
         backfill_failures = "consecutive_failures" not in existing_users
@@ -280,8 +282,10 @@ class Database:
         existing = await self.get_user(user_id)
         if existing:
             return existing
+        # OR IGNORE: два почти одновременных первых /start (двойное нажатие) оба не находят
+        # игрока и оба вставляют строку - второй INSERT иначе падал бы на PRIMARY KEY.
         await self._conn.execute(
-            """INSERT INTO users (user_id, username, first_name, registered_at, reg_state)
+            """INSERT OR IGNORE INTO users (user_id, username, first_name, registered_at, reg_state)
                VALUES (?, ?, ?, ?, 'time_of_day')""",
             (user_id, username, first_name, datetime.utcnow().isoformat()),
         )
@@ -327,6 +331,24 @@ class Database:
         await self._conn.execute(
             "UPDATE users SET last_reg_message_id = ? WHERE user_id = ?", (message_id, user_id)
         )
+        await self._conn.commit()
+
+    async def claim_guide(self, user_id: int) -> bool:
+        """
+        Атомарно "занимает" право отправить PDF-гайд при регистрации: True, если
+        гайд этому игроку ещё не отправлялся. Условный UPDATE защищает от дубля при
+        двух быстрых /start подряд (апдейты обрабатываются параллельно).
+        """
+        cur = await self._conn.execute(
+            "UPDATE users SET guide_sent = 1 WHERE user_id = ? AND COALESCE(guide_sent, 0) = 0",
+            (user_id,),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    async def release_guide(self, user_id: int):
+        """Возвращает право на отправку гайда (если отправка не удалась - попробуем при следующем /start)."""
+        await self._conn.execute("UPDATE users SET guide_sent = 0 WHERE user_id = ?", (user_id,))
         await self._conn.commit()
 
     async def set_profile_message(self, user_id: int, chat_id: int, message_id: int):
@@ -622,6 +644,33 @@ class Database:
             (status, datetime.utcnow().isoformat(), challenge_id),
         )
         await self._conn.commit()
+
+    async def complete_challenge_if_ready(self, challenge_id: int) -> bool:
+        """
+        Атомарно закрывает испытание как выполненное, но ТОЛЬКО если оно всё ещё
+        awaiting_action И все цели дня закрыты (есть хотя бы одна строка прогресса и
+        ни одной с completed = 0). Проверка условий и смена статуса - один UPDATE,
+        поэтому гонки невозможны: ручное "Завершить", авто-завершение по таймауту,
+        "Сдаться" и просрочка не могут закрыть одно и то же испытание дважды, а
+        прогресс, откаченный отрицательным числом за миг до этого, не будет
+        засчитан. Статус - completed_with_photo, если фото уже ушло в группу.
+        True - именно этот вызов закрыл испытание (и только он должен начислять награду).
+        """
+        cur = await self._conn.execute(
+            """UPDATE challenges
+               SET status = CASE WHEN physical_photo_posted = 1
+                                 THEN 'completed_with_photo' ELSE 'completed' END,
+                   active_focus = NULL,
+                   completed_at = ?
+               WHERE id = ? AND status = 'awaiting_action'
+                 AND EXISTS (SELECT 1 FROM challenge_progress WHERE challenge_id = ?)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM challenge_progress WHERE challenge_id = ? AND completed = 0
+                 )""",
+            (datetime.utcnow().isoformat(), challenge_id, challenge_id, challenge_id),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
 
     async def give_up_challenge(self, challenge_id: int) -> bool:
         """
