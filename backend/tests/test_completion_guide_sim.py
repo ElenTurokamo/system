@@ -7,7 +7,7 @@
 следующих суток. Запуск:  cd backend && python -m pytest tests -q
 """
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from tests import sim
@@ -493,16 +493,62 @@ def test_progress_rolled_back_right_before_deadline_is_not_counted():
     sim.run(sc)
 
 
-def test_warnings_are_still_sent_before_auto_finish_and_cleaned_after():
+def _warnings(s, uid=1):
+    return [kw["text"] for kw in s.bot.sent("send_message", uid) if "Предупреждение Системы" in kw["text"]]
+
+
+def _warnings_alive(s, uid=1):
+    return [txt for (cid, _), txt in s.bot.alive.items() if cid == uid and "Предупреждение Системы" in txt]
+
+
+def test_no_penalty_warnings_at_all_when_all_goals_are_closed():
     async def sc(s):
         ch = await setup_quest(s)
         await log(s, 1, ch["id"], "pushups", 10)
-        await s.until(t(1, 20, day=23))
-        warnings = [kw["text"] for kw in s.bot.sent("send_message", 1) if "Предупреждение Системы" in kw["text"]]
-        assert warnings, "предупреждение-напоминание должно приходить как раньше"
         await s.until(DEADLINE)
-        alive_warn = [txt for (cid, _), txt in s.bot.alive.items() if cid == 1 and "Предупреждение Системы" in txt]
-        assert alive_warn == []                                  # после завершения предупреждения убраны
+        assert _warnings(s) == [], "сообщения о штрафе не должны приходить при закрытых целях"
+        assert failure_pushes(s, 1) == []
+        assert await status_of(s, ch["id"]) == "completed"
+    sim.run(sc)
+
+
+def test_warnings_still_come_when_goals_are_not_closed():
+    async def sc(s):
+        ch = await setup_quest(s)
+        await log(s, 1, ch["id"], "pushups", 5)                 # цель не закрыта
+        await s.until(t(1, 50, day=23))                          # осталось ~10 минут
+        assert len(_warnings(s)) == 3                            # 60, 30 и 15 минут - как раньше
+        assert "менее 15 минут" in _warnings(s)[-1] and len(_warnings_alive(s)) == 1
+    sim.run(sc)
+
+
+def test_goals_closed_late_removes_hanging_warning_and_stops_next_ones():
+    async def sc(s):
+        ch = await setup_quest(s)
+        await log(s, 1, ch["id"], "pushups", 5)
+        await s.until(t(1, 35, day=23))                          # осталось 25 минут: 60 и 30 уже были
+        assert len(_warnings(s)) == 2 and len(_warnings_alive(s)) == 1
+        await log(s, 1, ch["id"], "pushups", 5)                  # закрыл цель
+        assert _warnings_alive(s) == []                          # висевшее предупреждение убрано сразу
+        await s.until(t(1, 50, day=23))                          # порог 15 минут пройден
+        assert len(_warnings(s)) == 2 and _warnings_alive(s) == []
+        await s.until(DEADLINE)
+        assert await status_of(s, ch["id"]) == "completed" and failure_pushes(s, 1) == []
+    sim.run(sc)
+
+
+def test_rollback_below_target_brings_warnings_back():
+    async def sc(s):
+        ch = await setup_quest(s)
+        await log(s, 1, ch["id"], "pushups", 10)                 # с самого начала закрыто - предупреждений нет
+        await s.until(t(1, 40, day=23))
+        assert _warnings(s) == []
+        await log(s, 1, ch["id"], "pushups", -4)                 # откатил: 6/10
+        await s.until(t(1, 42, day=23))
+        warnings = _warnings(s)
+        assert len(warnings) == 1 and "менее 30 минут" in warnings[0]   # самый срочный из пройденных порогов
+        await s.until(DEADLINE)
+        assert await status_of(s, ch["id"]) == "expired"
     sim.run(sc)
 
 
@@ -751,4 +797,233 @@ def test_quest_card_uses_the_short_divider():
         lines = text.split("\n")
         seps = [ln for ln in lines if ln and set(ln) == {"="}]
         assert len(seps) == 1 and len(seps[0]) <= 20
+    sim.run(sc)
+
+
+# ---------------------------------------------------------------- профиль: в чате ровно одно сообщение
+
+
+def _births(s, uid=1):
+    """Время рождения всех когда-либо присланных профилей (born хранит и удалённые)."""
+    keys = [k for k in s.bot.born if k[0] == uid and k in s.bot.profile_keys]
+    return sorted(s.bot.born[k] for k in keys)
+
+
+async def _watch_profiles(s, days, step=10, uid=1, play=False):
+    """
+    Гоним время, каждые `step` минут проверяя: профилей в чате не больше одного, и живой
+    профиль всегда моложе 48 ч (то есть его ещё можно редактировать/удалять).
+    play=True - игрок честно закрывает все цели каждого квеста (но "Завершить" не жмёт).
+    """
+    for _ in range(days * 24 * 60 // step):
+        await s.step(step)
+        if play:
+            ch = await s.db.get_active_challenge(uid)
+            if ch and ch["message_id"] and not await s.db.goals_ready(ch["id"]):
+                await log(s, uid, ch["id"], "pushups", 10)
+        alive = s.bot.profiles_alive(uid)
+        assert len(alive) <= 1, f"дубль профиля в {sim.Clock.now}: {alive}"
+        for key in alive:
+            assert sim.Clock.now - s.bot.born[key] < timedelta(hours=48), f"профиль устарел в {sim.Clock.now}"
+
+
+SLOT_EVENING_UTC = (14, 0)   # слот "вечером" (19:00 Алматы) = 14:00 UTC
+
+
+def test_active_player_gets_new_profile_only_together_with_the_daily_quest():
+    """Профиль создан командой в 07:59, квест приходит в 14:00. Новые профили появляются
+    ТОЛЬКО в момент выдачи квеста (над карточкой), а не в случайное время суток."""
+    async def sc(s):
+        from bot import profile
+        await s.make_user(1, slot="evening")
+        await s.db.set_group(1, GROUP)
+        await profile.resend_profile_message(s.bot, 1)                    # /profile в 07:59 UTC
+        first = sim.Clock.now
+        await _watch_profiles(s, days=9, play=True)
+
+        births = _births(s)
+        assert births[0] == first and len(births) >= 8
+        assert all((b.hour, b.minute) == SLOT_EVENING_UTC for b in births[1:]), births   # только в момент выдачи
+        # ровно по одному в сутки: профиль не пересоздаётся чаще
+        days = [b.date() for b in births[1:]]
+        assert len(days) == len(set(days))
+        # игрок реально играл (проверка, что сценарий не пустой)
+        assert (await s.db.get_user(1))["streak"] >= 7
+    sim.run(sc)
+
+
+def test_profile_is_not_recreated_when_player_just_asked_for_it():
+    async def sc(s):
+        from bot import profile
+        await s.make_user(1, slot="evening")
+        await s.until(t(13, 30, day=22))
+        await profile.resend_profile_message(s.bot, 1)                    # /profile за полчаса до выдачи
+        before = _births(s)
+        await s.until(t(14, 5, day=22))                                   # выдача: профилю 30 минут, не трогаем
+        assert _births(s) == before
+        assert len(s.bot.profiles_alive(1)) == 1
+    sim.run(sc)
+
+
+def test_player_under_penalty_gets_new_profile_only_at_dispatch_time():
+    async def sc(s):
+        from bot import profile
+        await s.make_user(1, slot="evening")                              # квест не выполняет: провал, штраф 48 ч
+        await profile.resend_profile_message(s.bot, 1)
+        first = sim.Clock.now
+        await _watch_profiles(s, days=4)
+        assert (await s.db.get_user(1))["penalty_until"] is not None
+        births = _births(s)
+        assert births[0] == first
+        assert all((b.hour, b.minute) == SLOT_EVENING_UTC for b in births[1:]), births
+    sim.run(sc)
+
+
+def test_stopped_player_gets_no_new_messages_and_profile_is_quietly_removed_in_time():
+    async def sc(s):
+        from bot import profile
+        from bot.handlers import start as h
+        await s.make_user(1, slot="evening")
+        await profile.resend_profile_message(s.bot, 1)
+        await h.on_stop_system_confirmed(_call(1, s.bot, "stopsys_yes:1"))
+        await s.step(10)
+        assert (await s.db.get_user(1))["is_stopped"] == 1
+        sent_after_stop = len(s.bot.sent("send_message", 1))
+        births_after_stop = len(_births(s))
+
+        await _watch_profiles(s, days=7)                                  # дубль/устаревший профиль - ошибка внутри
+        assert len(s.bot.sent("send_message", 1)) == sent_after_stop      # остановленному НИЧЕГО не присылали
+        assert len(_births(s)) == births_after_stop                       # в том числе новых профилей
+        assert s.bot.profiles_alive(1) == []                              # старый профиль тихо удалён до границы 48 ч
+        assert (await s.db.get_user(1))["profile_message_id"] is None
+
+        # игрок вернулся - в чате ровно один свежий профиль
+        await h.cmd_start(_message(1, s.bot), s.bot)
+        u = await s.db.get_user(1)
+        assert u["is_stopped"] == 0 and u["profile_message_id"]
+        assert len(s.bot.profiles_alive(1)) == 1
+    sim.run(sc)
+
+
+def test_autostopped_player_with_penalty_timer_gets_no_stray_profiles():
+    """Два провала подряд: штраф + автостоп. Таймер штрафа не должен воскрешать удалённый профиль."""
+    async def sc(s):
+        from bot import profile
+        await s.make_user(1, slot="evening")
+        await profile.resend_profile_message(s.bot, 1)
+        stop_seen = None
+        for _ in range(10 * 24 * 60 // 10):
+            await s.step(10)
+            u = await s.db.get_user(1)
+            if u["is_stopped"] and stop_seen is None:
+                stop_seen = sim.Clock.now
+            alive = s.bot.profiles_alive(1)
+            assert len(alive) <= 1
+            for key in alive:
+                assert sim.Clock.now - s.bot.born[key] < timedelta(hours=48)
+        assert stop_seen is not None, "сценарий не дошёл до автостопа"
+        assert [b for b in _births(s) if b > stop_seen] == []             # после остановки новых профилей нет
+    sim.run(sc)
+
+
+def test_legacy_profile_without_known_age_is_refreshed_once():
+    async def sc(s):
+        from bot import profile
+        await s.make_user(1, slot="evening")
+        await profile.resend_profile_message(s.bot, 1)
+        old_id = (await s.db.get_user(1))["profile_message_id"]
+        await s.db._conn.execute("UPDATE users SET profile_created_at = NULL WHERE user_id = 1")
+        await s.db._conn.commit()
+        await s.step(10)
+        u = await s.db.get_user(1)
+        assert u["profile_message_id"] != old_id and u["profile_created_at"]
+        assert len(s.bot.profiles_alive(1)) == 1
+        new_id = u["profile_message_id"]
+        await s.step(60)
+        assert (await s.db.get_user(1))["profile_message_id"] == new_id   # больше не трогается
+    sim.run(sc)
+
+
+def test_short_bot_downtime_near_the_deadline_does_not_cause_duplicate():
+    async def sc(s):
+        from bot import profile
+        await s.make_user(1, slot="evening")
+        await profile.resend_profile_message(s.bot, 1)
+        await s.until(t(1, 0, day=24))
+        s.cron_down = True                                                # бот лежит 5 часов (запас - 6)
+        await s.until(t(6, 0, day=24))
+        s.cron_down = False
+        await _watch_profiles(s, days=1)
+        assert len(s.bot.profiles_alive(1)) <= 1
+    sim.run(sc)
+
+
+def test_fresh_profile_is_not_touched_by_the_safety_job():
+    async def sc(s):
+        from bot import profile, scheduler
+        await s.make_user(1, slot="evening")
+        await profile.resend_profile_message(s.bot, 1)
+        before = len(s.bot.log)
+        await scheduler.refresh_stale_profiles(s.bot)
+        assert len(s.bot.log) == before
+    sim.run(sc)
+
+
+def test_safety_job_does_not_hammer_unreachable_player():
+    async def sc(s):
+        from bot import profile
+        await s.make_user(1, slot="evening")
+        await profile.resend_profile_message(s.bot, 1)
+        await s.until(t(15, 0, day=22))                                   # выдача уже прошла, до следующей - сутки
+        # профиль "состарился" до границы (41 ч 50 мин), а игрок заблокировал бота
+        aged = (sim.Clock.now - timedelta(hours=41, minutes=50)).isoformat()
+        await s.db._conn.execute("UPDATE users SET profile_created_at = ? WHERE user_id = 1", (aged,))
+        await s.db._conn.commit()
+        s.bot.blocked.add(1)
+
+        calls = []
+        real = profile.ensure_fresh_profile_message
+
+        async def spy(bot, uid):
+            calls.append(sim.Clock.now)
+            return await real(bot, uid)
+        profile.ensure_fresh_profile_message = spy
+        try:
+            await s.step(120)                                             # 2 часа, джоба гоняется каждые 10 минут
+        finally:
+            profile.ensure_fresh_profile_message = real
+        assert 1 <= len(calls) <= 5                                       # раз в 30 минут, а не каждые 10
+    sim.run(sc)
+
+
+def test_photo_report_and_auto_report_number_days_the_same_way_from_one():
+    async def sc(s):
+        from bot.handlers import challenge as h
+        chs = await setup_quests(s, [(1, ("pushups",), GROUP), (2, ("pushups",), GROUP)])
+        for uid in (1, 2):
+            await s.db._conn.execute("UPDATE users SET streak = 2 WHERE user_id = ?", (uid,))
+        await s.db._conn.commit()
+        await log(s, 1, chs[1]["id"], "pushups", 20)
+        await log(s, 2, chs[2]["id"], "pushups", 20)
+        photo = _message(1, s.bot)
+        photo.photo = [MagicMock(file_id="P")]
+        await h.on_photo_received(photo, s.bot)                  # игрок 1 прислал фото, игрок 2 - нет
+        cap = s.bot.sent("send_photo", GROUP)[0]["caption"]
+        assert cap == "Отчёт дня 3. Игрок 1 завершил испытание.\n\n🌟 В день 3 также пройдено секретное испытание."
+        await s.until(DEADLINE)
+        assert group_texts(s) == [
+            "Отчёт дня 3. Игрок 2 завершил испытание.\n\n🌟 В день 3 также пройдено секретное испытание."
+        ]
+    sim.run(sc)
+
+
+def test_first_ever_report_is_day_one():
+    async def sc(s):
+        from bot.handlers import challenge as h
+        ch = await setup_quest(s)
+        await log(s, 1, ch["id"], "pushups", 10)
+        photo = _message(1, s.bot)
+        photo.photo = [MagicMock(file_id="P")]
+        await h.on_photo_received(photo, s.bot)
+        assert s.bot.sent("send_photo", GROUP)[0]["caption"] == "Отчёт дня 1. Игрок 1 завершил испытание."
     sim.run(sc)

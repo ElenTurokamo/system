@@ -74,6 +74,13 @@ class FakeBot:
         self.card_ids = []      # (chat_id, message_id) - успешно отправленные карточки
         self.card_log = []      # (chat_id, message_id, utc_now)
         self.on_card_sent = None  # async-колбэк(chat_id): проверки инвариантов в момент отправки
+        self.born = {}          # (chat_id, message_id) -> Clock.now в момент отправки (лимит Telegram 48 ч)
+        self.profile_keys = set()   # (chat_id, message_id) всех когда-либо присланных профилей (в т.ч. удалённых)
+
+    def _too_old(self, chat_id, message_id):
+        """Telegram: сообщение старше 48 часов нельзя ни удалить, ни отредактировать."""
+        born = self.born.get((chat_id, message_id))
+        return born is not None and Clock.now - born > timedelta(hours=48)
 
     def _check(self, method, chat_id, kw):
         if chat_id in self.blocked:
@@ -91,6 +98,9 @@ class FakeBot:
             raise
         self._id += 1
         self.alive[(chat_id, self._id)] = text
+        self.born[(chat_id, self._id)] = Clock.now
+        if text.startswith("『Профиль Игрока』"):
+            self.profile_keys.add((chat_id, self._id))
         self.log.append(("send_message", chat_id, {"text": text, **kw}))
         if is_card:
             self.card_attempts.append((chat_id, True))
@@ -105,6 +115,7 @@ class FakeBot:
         self._check("send_document", chat_id, {"document": document, **kw})
         self._id += 1
         self.alive[(chat_id, self._id)] = caption or ""
+        self.born[(chat_id, self._id)] = Clock.now
         self.log.append(("send_document", chat_id, {"document": document, "caption": caption, **kw}))
         return Msg(self._id, document=_Doc("FAKE_FILE_ID"))
 
@@ -112,11 +123,14 @@ class FakeBot:
         self._check("send_photo", chat_id, {"photo": photo, **kw})
         self._id += 1
         self.alive[(chat_id, self._id)] = caption or ""
+        self.born[(chat_id, self._id)] = Clock.now
         self.log.append(("send_photo", chat_id, {"photo": photo, "caption": caption, **kw}))
         return Msg(self._id)
 
     async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
         self._check("edit_message_text", chat_id, kw)
+        if self._too_old(chat_id, message_id):
+            raise TelegramBadRequest(method=_method(), message="Bad Request: message can't be edited")
         self.log.append(("edit_message_text", chat_id, {"text": text, "message_id": message_id}))
         if (chat_id, message_id) in self.alive:
             self.alive[(chat_id, message_id)] = text
@@ -124,6 +138,8 @@ class FakeBot:
 
     async def delete_message(self, chat_id, message_id, **kw):
         self._check("delete_message", chat_id, kw)
+        if self._too_old(chat_id, message_id):
+            raise TelegramBadRequest(method=_method(), message="Bad Request: message can't be deleted for everyone")
         self.log.append(("delete_message", chat_id, {"message_id": message_id}))
         self.alive.pop((chat_id, message_id), None)
         return True
@@ -147,6 +163,10 @@ class FakeBot:
     def sent(self, method, chat_id):
         """Все вызовы метода в чат: список kwargs (для send_message там есть 'text')."""
         return [kw for (m, cid, kw) in self.log if m == method and cid == chat_id]
+
+    def profiles_alive(self, chat_id):
+        """Сообщения профиля игрока, которые сейчас видны в чате (ожидается не больше одного)."""
+        return [k for k, txt in self.alive.items() if k[0] == chat_id and txt.startswith("『Профиль Игрока』")]
 
     def card_attempt_count(self, chat_id):
         return len([a for a in self.card_attempts if a[0] == chat_id])
@@ -208,6 +228,8 @@ class Sim:
             await scheduler.expire_stale_challenges(self.bot)
             await scheduler.send_failure_warnings(self.bot)
             await scheduler.refresh_challenge_timers(self.bot)
+            if (Clock.now.minute % 10) == 0:   # как interval=10 минут в планировщике
+                await scheduler.refresh_stale_profiles(self.bot)
 
     async def until(self, target: datetime):
         while Clock.now < target:
@@ -225,8 +247,23 @@ class Sim:
         return (await cur.fetchone())[0]
 
 
+_PROJECT_MODULES = (
+    "bot.dispatch", "bot.profile", "bot.challenge_render", "bot.scheduler", "bot.completion",
+    "bot.guide", "bot.utils", "bot.friends", "bot.failure_policy", "bot.registration",
+    "bot.handlers.start", "bot.handlers.challenge", "bot.handlers.misc", "bot.handlers.group",
+    "bot.handlers.friends", "bot.handlers.stats",
+)
+
+
 def fresh_modules():
     """Подменяем datetime во всех модулях проекта и сбрасываем межтестовое состояние."""
+    # Сначала импортируем ВСЕ модули проекта, и только потом подменяем в них datetime.
+    # Раньше модули, впервые импортированные уже после подмены (при самом первом сценарии
+    # в процессе), видели настоящее время: одиночный запуск теста вёл себя не так, как
+    # в составе набора, а часть проверок проходила вхолостую.
+    import importlib
+    for name in _PROJECT_MODULES:
+        importlib.import_module(name)
     for name, mod in list(sys.modules.items()):
         if name.startswith("bot") and getattr(mod, "datetime", None) is REAL_DATETIME:
             mod.datetime = FakeDT
@@ -243,6 +280,8 @@ def fresh_modules():
     for task in list(utils._delete_tasks.values()):
         task.cancel()
     utils._delete_tasks.clear()
+    import bot.scheduler as sched
+    sched._stale_profile_retry_at.clear()
     import bot.challenge_render as cr
     cr._giveup_confirm_until.clear()
     cr._flood_until.clear()

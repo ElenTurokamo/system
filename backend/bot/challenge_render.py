@@ -421,6 +421,13 @@ async def maybe_send_failure_warning(bot: Bot, challenge: dict) -> bool:
     if threshold is None:
         return False
 
+    # Все цели дня уже закрыты - провал игроку не грозит (испытание всё равно будет
+    # засчитано, даже если он забудет нажать "Завершить" - см. bot/completion.py),
+    # а текст про штраф был бы ложным. Порог при этом НЕ занимается: если игрок
+    # потом откатит прогресс ниже цели, предупреждение придёт как обычно.
+    if await db.goals_ready(challenge["id"]):
+        return False
+
     # Порог занимается ДО отправки (атомарный UPDATE с условием): так два
     # параллельных запуска джобы не пришлют дубль. Если отправка потом не
     # удастся - это одно потерянное предупреждение, а не бесконечные повторы
@@ -454,7 +461,11 @@ async def maybe_send_failure_warning(bot: Bot, challenge: dict) -> bool:
     # Пока шли попытки отправки, игрок мог завершить/сдать испытание - тогда
     # только что отправленное предупреждение уже ложное, убираем его сразу.
     fresh = await db.get_challenge(challenge["id"])
-    if not fresh or fresh["status"] != "awaiting_action":
+    if (
+        not fresh
+        or fresh["status"] != "awaiting_action"
+        or await db.goals_ready(challenge["id"])  # цели закрыли, пока шла отправка
+    ):
         await clear_warning_message(bot, challenge["id"])
         return False
     return True

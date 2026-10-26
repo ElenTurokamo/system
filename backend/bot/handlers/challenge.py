@@ -90,6 +90,13 @@ async def on_amount_logged(message: Message):
             bonus_xp = xp_reward_for_challenge(user["level"]) * BONUS_XP_MULTIPLIER
             await db.add_xp(message.from_user.id, bonus_xp)
 
+    # Закрыта последняя цель - уже висящее предупреждение о штрафе ("осталось менее N
+    # минут") теряет смысл: провал не грозит. Убираем его сразу; если игрок потом
+    # откатит прогресс ниже цели, предупреждения вернутся (см.
+    # challenge_render.maybe_send_failure_warning).
+    if await db.goals_ready(challenge["id"]):
+        await challenge_render.clear_warning_message(message.bot, challenge["id"])
+
     # Испытание НЕ завершается автоматически: как только все цели закрыты, в сообщении
     # появляется кнопка "Завершить испытание". Пока её не нажали, можно продолжать
     # копить подходы на любой дисциплине (в том числе ради секретного бонуса).
@@ -124,8 +131,10 @@ async def on_photo_received(message: Message, bot):
         # не получится, памп пройдёт. Полный бонус (x2 XP) от этого никак не
         # зависит и по-прежнему даётся только при закрытии ВСЕГО испытания.
         physical_bonus = await db.physical_bonus_achieved(challenge["id"])
+        # Серия в БД увеличится только при завершении испытания, а отчёт - про текущий
+        # день, поэтому +1: первый день - "день 1" (так же считает авто-отчёт, см. completion.py).
         caption = tx.photo_caption(
-            user["streak"],
+            user["streak"] + 1,
             message.from_user.id,
             physical_bonus_claimed=physical_bonus,
         )

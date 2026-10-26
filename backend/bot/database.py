@@ -333,6 +333,22 @@ class Database:
         )
         await self._conn.commit()
 
+    async def get_users_with_stale_profile(self, max_age_hours: float) -> list[dict]:
+        """
+        Игроки, у которых сообщению профиля уже не меньше max_age_hours (или возраст
+        неизвестен - колонка profile_created_at пуста у профилей, созданных до её
+        появления). Им пора пересоздать профиль, пока Telegram ещё разрешает удалить
+        старое сообщение (см. scheduler.refresh_stale_profiles).
+        """
+        cutoff = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
+        cur = await self._conn.execute(
+            "SELECT * FROM users WHERE profile_message_id IS NOT NULL "
+            "AND (profile_created_at IS NULL OR profile_created_at <= ?)",
+            (cutoff,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def claim_guide(self, user_id: int) -> bool:
         """
         Атомарно "занимает" право отправить PDF-гайд при регистрации: True, если
@@ -356,6 +372,14 @@ class Database:
             "UPDATE users SET profile_chat_id = ?, profile_message_id = ?, profile_created_at = ? "
             "WHERE user_id = ?",
             (chat_id, message_id, datetime.utcnow().isoformat(), user_id),
+        )
+        await self._conn.commit()
+
+    async def clear_profile_message(self, user_id: int):
+        """Профиля в чате больше нет (удалён, см. profile.retire_profile_message)."""
+        await self._conn.execute(
+            "UPDATE users SET profile_message_id = NULL, profile_created_at = NULL WHERE user_id = ?",
+            (user_id,),
         )
         await self._conn.commit()
 
@@ -999,6 +1023,21 @@ class Database:
                 (should_be_completed, challenge_id, focus_key),
             )
             await self._conn.commit()
+
+    async def goals_ready(self, challenge_id: int) -> bool:
+        """
+        Все цели дня закрыты: есть хотя бы одна строка прогресса и ни одной с
+        completed = 0. То же условие, по которому испытание можно завершить (кнопка
+        \"Завершить\" / авто-завершение): пока оно выполнено, провал игроку не грозит,
+        поэтому предупреждения о штрафе в этот момент неуместны.
+        """
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) AS total, COALESCE(SUM(completed = 0), 0) AS open_ "
+            "FROM challenge_progress WHERE challenge_id = ?",
+            (challenge_id,),
+        )
+        row = await cur.fetchone()
+        return row["total"] > 0 and row["open_"] == 0
 
     async def all_progress_completed(self, challenge_id: int) -> bool:
         cur = await self._conn.execute(

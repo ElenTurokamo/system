@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
@@ -156,6 +156,47 @@ async def cleanup_failure_messages(bot: Bot):
         await profile.clear_failure_message(bot, user)
 
 
+# Не чаще одной попытки на игрока за это время: если пересоздать профиль не
+# удаётся (бот заблокирован, сеть), джоба не должна долбиться каждые 10 минут.
+_STALE_PROFILE_RETRY = timedelta(minutes=30)
+_stale_profile_retry_at: dict[int, datetime] = {}
+
+
+async def refresh_stale_profiles(bot: Bot):
+    """
+    СТРАХОВКА для профилей, до которых не дошло ежедневное обновление при выдаче квеста
+    (profile.ensure_fresh_profile_message): профиль подошёл к границе (окно - запас = 42 ч),
+    а новый квест игроку не выдавался. Работает раз в 10 минут, но срабатывает редко.
+
+    Основной механизм - пересоздание профиля при выдаче квеста: оно происходит в то же
+    время суток, что и сам квест, и профиль всегда оказывается над новой карточкой.
+    Эта же джоба нужна только тем, у кого выдачи нет:
+      * остановленным игрокам (/stop, автостоп) профиль НЕ присылается заново - он тихо
+        удаляется, пока Telegram это позволяет (profile.retire_profile_message), а при
+        возвращении (/start) создаётся свежий. Иначе мы слали бы сообщения тому, кто
+        просил их не присылать, а старый профиль после 48 ч остался бы в чате дублем;
+      * остальным (редкий сбой выдачи) профиль пересоздаётся как при обычной выдаче.
+    Telegram не позволяет ни править, ни удалять сообщения старше 48 часов - отсюда
+    все эти меры (см. README, "One profile message, always").
+    """
+    threshold = settings.profile_edit_window_hours - settings.profile_refresh_buffer_hours
+    users = await db.get_users_with_stale_profile(threshold)
+    now = datetime.utcnow()
+    for user in users:
+        user_id = user["user_id"]
+        retry_at = _stale_profile_retry_at.get(user_id)
+        if retry_at is not None and now < retry_at:
+            continue
+        _stale_profile_retry_at[user_id] = now + _STALE_PROFILE_RETRY
+        try:
+            if user.get("is_stopped"):
+                await profile.retire_profile_message(bot, user_id)
+            else:
+                await profile.ensure_fresh_profile_message(bot, user_id)
+        except Exception:
+            logger.exception("Сбой обслуживания устаревшего профиля %s", user_id)
+
+
 async def refresh_penalty_profiles(bot: Bot):
     """
     Перерисовывает профиль каждому игроку с активным (или только что истёкшим)
@@ -164,6 +205,10 @@ async def refresh_penalty_profiles(bot: Bot):
     """
     users = await db.get_users_with_active_penalty()
     for user in users:
+        # Профиля в чате нет (остановленный игрок, см. profile.retire_profile_message) -
+        # таймер штрафа его заново не создаёт: sync на пустом месте присылал бы сообщение.
+        if not user.get("profile_message_id"):
+            continue
         try:
             await profile.sync_profile_message(bot, user["user_id"])
         except Exception:
@@ -236,6 +281,20 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         args=[bot],
         id="failure_message_cleanup",
         replace_existing=True,
+    )
+
+    # Пересоздание профиля, пока ему не исполнилось 48 часов (иначе старое сообщение
+    # уже не удалить и оно остаётся дублем). Первый запуск - сразу при старте бота.
+    scheduler.add_job(
+        refresh_stale_profiles,
+        "interval",
+        minutes=10,
+        args=[bot],
+        id="stale_profile_refresh",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(ZoneInfo(settings.tz)),
     )
 
     # Обновление таймера "до снятия ограничений" в профиле - раз в минуту

@@ -241,24 +241,33 @@ async def clear_failure_message(bot: Bot, user: dict):
     await db.clear_failure_message(user["user_id"])
 
 
-def _is_profile_stale(user: dict) -> bool:
+def _is_profile_stale(user: dict, lookahead_hours: float = 0) -> bool:
     """
-    True, если текущему сообщению профиля уже >= (profile_edit_window_hours -
-    profile_refresh_buffer_hours) часов - т.е. оно приближается к границе,
-    после которой Telegram Bot API перестаёт разрешать editMessageText.
-    Используется ТОЛЬКО диспетчером ежедневных квестов (см.
-    ensure_fresh_profile_message), чтобы решить, пересоздавать профиль в
-    момент выдачи квеста или достаточно обычного edit'а.
+    True, если сообщению профиля пора обновиться: ему уже >= (profile_edit_window_hours -
+    profile_refresh_buffer_hours - lookahead_hours) часов. Telegram не даёт ни
+    редактировать, ни удалять сообщение старше окна (48 ч), поэтому профиль нужно
+    пересоздать ДО границы, пока старое ещё можно удалить.
+
+    lookahead_hours - "взгляд вперёд": диспетчер квестов вызывает проверку раз в сутки,
+    и если не пересоздать профиль сейчас, то к следующей проверке он может уже
+    перейти границу. С lookahead = 24 профиль гарантированно доживает до следующей
+    выдачи моложе (окно - запас).
     """
+    # Возраст неизвестен (профиль создан до появления колонки profile_created_at или
+    # значение испорчено) - считаем профиль устаревшим: один раз пересоздаём и
+    # дальше возраст известен. Раньше здесь был False, и такой профиль не
+    # обновлялся НИКОГДА - после 48 ч он переставал редактироваться и дублировался.
     created_at = user.get("profile_created_at")
     if not created_at:
-        return False
+        return True
     try:
         created = datetime.fromisoformat(created_at)
     except (TypeError, ValueError):
-        return False
-    threshold_hours = settings.profile_edit_window_hours - settings.profile_refresh_buffer_hours
-    return datetime.utcnow() - created >= timedelta(hours=threshold_hours)
+        return True
+    threshold_hours = (
+        settings.profile_edit_window_hours - settings.profile_refresh_buffer_hours - lookahead_hours
+    )
+    return datetime.utcnow() - created >= timedelta(hours=max(threshold_hours, 0))
 
 
 # Блокировки на игрока: все операции, меняющие/пересоздающие сообщение профиля,
@@ -503,26 +512,51 @@ async def sync_profile_message(bot: Bot, user_id: int):
 
 async def ensure_fresh_profile_message(bot: Bot, user_id: int):
     """
-    Используется ИСКЛЮЧИТЕЛЬНО ежедневным диспетчером квестов
-    (см. scheduler.dispatch_daily_challenges), вызывается один раз в день - в
-    момент выдачи испытания на собственный временной слот игрока (а также в
-    слот, пропущенный из-за действующего ограничения - чтобы профиль не
-    "состарился" за время паузы).
+    Вызывается в момент выдачи ежедневного испытания (а также в слот, пропущенный из-за
+    штрафа) и фоновой страховкой (scheduler.refresh_stale_profiles).
 
-    Если сообщение профиля приближается к границе, после которой Telegram
-    перестанет давать его редактировать (см. _is_profile_stale) - пересоздаёт
-    его. Иначе - обычный лёгкий edit (sync_profile_message).
+    Если профиль не доживёт до следующей выдачи моложе границы редактирования (см.
+    _is_profile_stale с взглядом вперёд на сутки) - пересоздаёт его: новое сообщение
+    появляется прямо перед карточкой квеста, старое удаляется. Иначе - лёгкий edit.
+    При ежедневной выдаче это означает "новый профиль каждый день", а если игрок сам
+    недавно вызвал /profile - профиль не трогается. Раз в двое суток нельзя:
+    через 48 ч сообщение уже не удалить.
     """
     async with _profile_lock(user_id):
         user = await db.get_user(user_id)
         if not user:
             return
-        if user.get("profile_message_id") and _is_profile_stale(user):
+        if user.get("profile_message_id") and _is_profile_stale(
+            user, lookahead_hours=settings.profile_dispatch_lookahead_hours
+        ):
             text = await _build_profile_text(user)
             await _replace_profile(bot, user, text)
             return
 
     await sync_profile_message(bot, user_id)
+
+
+async def retire_profile_message(bot: Bot, user_id: int) -> bool:
+    """
+    Убирает профиль остановленного игрока (/stop или автостоп), не присылая ничего
+    нового. Остановленному игроку квесты не приходят, значит и "естественного" момента
+    для нового сообщения нет, а слать ему профиль в случайное время - спам. Но и оставить
+    сообщение нельзя: через 48 ч его не удалить, и после возвращения (/start) в чате
+    остались бы два профиля. Поэтому пока можно - профиль тихо удаляется (вместе с
+    закрепом); при возвращении игрока /start создаст свежий.
+    True - профиля в чате больше нет.
+    """
+    async with _profile_lock(user_id):
+        user = await db.get_user(user_id)
+        if not user or not user.get("is_stopped") or not user.get("profile_message_id"):
+            return False
+        chat_id = user.get("profile_chat_id") or user_id
+        message_id = user["profile_message_id"]
+        await _unpin_all(bot, chat_id, fallback_message_id=message_id)
+        if not await _delete_message_with_retries(bot, chat_id, message_id):
+            return False
+        await db.clear_profile_message(user_id)
+        return True
 
 
 async def resend_profile_message(bot: Bot, user_id: int):

@@ -16,6 +16,8 @@ _DIRECTLY_COMPLETED: set[int] = set()
 # id испытаний, где игрок закрыл все цели, но "Завершить" не нажал: фаззер сам их не закрывает,
 # их должно подобрать авто-завершение по таймауту (если раньше не сработал /stop).
 _FORGOT_TO_FINISH: set[int] = set()
+# сообщения профиля, которые бот не мог обновить вовремя (игрок заблокирован/бот выключен в окне 42-48 ч).
+_PROFILE_UNREACHABLE: set[tuple[int, int]] = set()
 
 
 async def _check_invariants(s, uid_slots):
@@ -51,6 +53,21 @@ async def _check_invariants(s, uid_slots):
         if r["n"]:  # испытания, закрытые напрямую через db.complete_challenge в самом фаззере, строк прогресса не трогают
             assert r["n"] == (r["done"] or 0) or row["id"] in _DIRECTLY_COMPLETED, f"I11: {row['id']} выполнено без закрытых целей"
 
+    # I12: в чате у каждого игрока не больше одного сообщения профиля. Единственное
+    # допустимое исключение - ограничение Telegram: если пока профилю было 42+ часа (время
+    # пересоздания), игрок был заблокирован или бот не работал, профиль мог состариться
+    # за 48 ч, а такое сообщение удалить уже нельзя. Такой "неуязвимый" старый профиль
+    # (его id попал в _PROFILE_UNREACHABLE) дублем не считается.
+    for uid in uid_slots:
+        alive = s.bot.profiles_alive(uid)
+        for key in alive:
+            if Clock.now - s.bot.born[key] >= timedelta(hours=42) and (uid in s.bot.blocked or s.cron_down):
+                _PROFILE_UNREACHABLE.add(key)
+        if len(alive) > 1:
+            newest = max(alive, key=lambda k: s.bot.born[k])
+            stuck = [k for k in alive if k != newest and k not in _PROFILE_UNREACHABLE]
+            assert not stuck, f"I12: у игрока {uid} дубль профиля {stuck} в чате в {Clock.now}"
+
     if not (s.cron_down):
         stuck = (Clock.now - timedelta(minutes=3)).isoformat()
         cur = await q("SELECT * FROM dispatch_log WHERE status='pending' AND next_attempt_at < ?", (stuck,))
@@ -60,6 +77,7 @@ async def _check_invariants(s, uid_slots):
 async def _scenario(s, seed, days=3):
     _DIRECTLY_COMPLETED.clear()
     _FORGOT_TO_FINISH.clear()
+    _PROFILE_UNREACHABLE.clear()
     rnd = random.Random(seed)
     Clock.now = datetime(2026, 10, 22, 0, 0)
     slots = ["morning", "day", "evening", "night"]
@@ -109,6 +127,9 @@ async def _scenario(s, seed, days=3):
                 if a and a.get("message_id") and a["id"] not in _FORGOT_TO_FINISH:
                     await s.db.complete_challenge(a["id"], False)
                     _DIRECTLY_COMPLETED.add(a["id"])
+            elif r < 0.0104 and r >= 0.0100:      # игрок набрал /profile: профиль пересоздаётся в случайное время суток
+                from bot import profile as _profile
+                await _profile.resend_profile_message(s.bot, u)
             elif r < 0.0100:                      # закрыл ВСЕ цели, но "Завершить" не нажал
                 a = await s.db.get_active_challenge(u)
                 if a and a.get("message_id") and a["id"] not in _FORGOT_TO_FINISH:

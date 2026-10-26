@@ -49,9 +49,12 @@ async def complete_challenge_flow(bot: Bot, challenge: dict, *, auto: bool = Fal
     # Дальше испытание закрыто за нами: награда начисляется ровно один раз.
     user = await db.get_user(user_id)
     reward = xp_reward_for_challenge(user["level"])
+    # Номер дня в отчёте группы - серия С УЧЁТОМ этого дня, как и в фото-отчёте
+    # (handlers/challenge.py::on_photo_received): первый день - "день 1".
+    report_day = user["streak"] + 1
 
     await db.add_xp(user_id, reward)
-    new_streak = await db.increment_streak(user_id)
+    await db.increment_streak(user_id)
     # Выполненное испытание прерывает серию провалов подряд (см. failure_policy).
     await db.reset_failures(user_id)
     await db.record_daily_stats(challenge_id)
@@ -69,13 +72,13 @@ async def complete_challenge_flow(bot: Bot, challenge: dict, *, auto: bool = Fal
     # Отчёт в группу идёт ДО обновления профиля: профиль при сбоях edit ждёт
     # повторных попыток по 30 с, и друзья не должны ждать отчёта из-за этого.
     if auto:
-        await _post_auto_report(bot, challenge_id, user_id, new_streak)
+        await _post_auto_report(bot, challenge_id, user_id, report_day)
 
     await profile.sync_profile_message(bot, user_id)
     return True
 
 
-async def _post_auto_report(bot: Bot, challenge_id: int, user_id: int, streak: int) -> None:
+async def _post_auto_report(bot: Bot, challenge_id: int, user_id: int, report_day: int) -> None:
     """
     Текстовый отчёт о завершении в привязанную группу (без фото). Любой сбой
     только логируется: испытание уже засчитано, и из-за недоступной группы
@@ -96,8 +99,8 @@ async def _post_auto_report(bot: Bot, challenge_id: int, user_id: int, streak: i
         # испытаний только из шахмат/чтения: у них физических дисциплин нет.
         secret = bool(challenge.get("bonus_claimed")) or await db.physical_bonus_achieved(challenge_id)
 
-        # "Отчёт дня N": N - серия С УЧЁТОМ только что засчитанного дня.
-        text = tx.photo_caption(streak, user_id, physical_bonus_claimed=secret)
+        # Тот же текст, что под фото (messages.photo_caption), и тот же отсчёт дней.
+        text = tx.photo_caption(report_day, user_id, physical_bonus_claimed=secret)
         group_id = user["group_id"]
         await call_with_retries(
             lambda: bot.send_message(group_id, text),
