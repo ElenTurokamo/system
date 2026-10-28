@@ -29,6 +29,9 @@ from bot.config import (
     CHALLENGE_COUNTDOWN_WINDOW_SECONDS,
     FAILURE_WARNING_MINUTES,
     FOCUS_OPTIONS,
+    ease_available,
+    eased_target,
+    level_from_total_xp,
     settings,
 )
 from bot.database import db
@@ -40,6 +43,9 @@ logger = logging.getLogger(__name__)
 # 20 знаков по ширине ≈ 12 знаков SYSTEM_DIVIDER (см. messages.py): визуально обе
 # линии одинаковы и целиком помещаются в пузырь на узких экранах (iPhone mini).
 DIVIDER = "=" * 20
+
+# Строка на карточке после подтверждённого снижения сложности.
+EASED_CARD_NOTE = "📉 Сложность снижена: цели и награда вдвое меньше, секретное испытание сегодня недоступно."
 
 
 def _join(lines: list[str]) -> str:
@@ -157,6 +163,8 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
         # Подсказка про фото пропадает сама при следующей перерисовке после того,
         # как физ. фото отправлено или пропущено.
         text = quest
+        if challenge.get("eased"):
+            text += f"\n\n{EASED_CARD_NOTE}"
         if _physical_photo_pending(challenge, progress_rows):
             text += "\n\n📸 Пришли фото выполнения всех физических активностей."
 
@@ -197,7 +205,22 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
     return quest + _join(lines)
 
 
-def _build_keyboard(challenge: dict, progress_rows: list[dict]):
+def ease_offered(challenge: dict, progress_rows: list[dict], user: Optional[dict]) -> bool:
+    """
+    Показывать ли кнопку "📉 Снизить сложность": игрок достиг нужного уровня (см.
+    config.EASE_UNLOCK_LEVEL), сложность сегодня ещё не понижена и не все цели дня закрыты
+    (при всех закрытых целях кнопка пропадает до конца дня). Уровень считается из XP - так же,
+    как цели при создании испытания (Database.create_challenge).
+    """
+    if challenge["status"] != "awaiting_action" or challenge.get("eased") or not user:
+        return False
+    if not progress_rows or all(p["completed"] for p in progress_rows):
+        return False
+    level, _, _ = level_from_total_xp(user["xp"])
+    return ease_available(level)
+
+
+def _build_keyboard(challenge: dict, progress_rows: list[dict], show_ease: bool = False):
     status = challenge["status"]
     if status != "awaiting_action":
         return None  # финальные статусы - клавиатура убирается
@@ -205,8 +228,17 @@ def _build_keyboard(challenge: dict, progress_rows: list[dict]):
     show_finish = bool(progress_rows) and all(p["completed"] for p in progress_rows)
     show_skip_photo = _physical_photo_pending(challenge, progress_rows)
     return kb.challenge_kb(
-        challenge["id"], progress_rows, challenge["active_focus"], show_finish, show_skip_photo
+        challenge["id"], progress_rows, challenge["active_focus"], show_finish, show_skip_photo, show_ease
     )
+
+
+async def _render_card(challenge: dict) -> tuple[str, object]:
+    """Текст и клавиатура карточки по актуальному состоянию - единая сборка для отправки и редактирования."""
+    progress_rows = await db.get_progress_rows(challenge["id"])
+    text = await _build_text(challenge, progress_rows)
+    user = await db.get_user(challenge["user_id"]) if challenge["status"] == "awaiting_action" else None
+    markup = _build_keyboard(challenge, progress_rows, ease_offered(challenge, progress_rows, user))
+    return text, markup
 
 
 # Карточки, на которых сейчас показан экран "Сдаться? Да/Нет": challenge_id ->
@@ -217,6 +249,9 @@ def _build_keyboard(challenge: dict, progress_rows: list[dict]):
 # откатывается к обычной карточке сам (на ближайшем тике таймера).
 _GIVEUP_CONFIRM_TTL_SECONDS = 45.0
 _giveup_confirm_until: dict[int, float] = {}
+
+# То же для экрана "Снизить сложность? Да/Нет" (см. push_ease_confirm).
+_ease_confirm_until: dict[int, float] = {}
 
 # Chat/user_id -> момент (time.monotonic), до которого Telegram просил не
 # редактировать сообщения (RetryAfter). Только для таймерных перерисовок: они
@@ -231,6 +266,16 @@ def _giveup_confirm_active(challenge_id: int) -> bool:
     if time.monotonic() < until:
         return True
     _giveup_confirm_until.pop(challenge_id, None)
+    return False
+
+
+def _ease_confirm_active(challenge_id: int) -> bool:
+    until = _ease_confirm_until.get(challenge_id)
+    if until is None:
+        return False
+    if time.monotonic() < until:
+        return True
+    _ease_confirm_until.pop(challenge_id, None)
     return False
 
 
@@ -257,6 +302,7 @@ async def push_challenge_update(bot: Bot, challenge_id: int, *, from_timer: bool
         # profile.py). Чтобы не дублировать её в чате, карточка испытания
         # просто удаляется.
         _giveup_confirm_until.pop(challenge_id, None)
+        _ease_confirm_until.pop(challenge_id, None)
         await clear_warning_message(bot, challenge_id)
         try:
             await bot.delete_message(challenge["user_id"], challenge["message_id"])
@@ -267,7 +313,7 @@ async def push_challenge_update(bot: Bot, challenge_id: int, *, from_timer: bool
     if from_timer:
         if status != "awaiting_action":
             return False
-        if _giveup_confirm_active(challenge_id):
+        if _giveup_confirm_active(challenge_id) or _ease_confirm_active(challenge_id):
             return False
         if time.monotonic() < _flood_until.get(challenge["user_id"], 0.0):
             return False
@@ -275,10 +321,9 @@ async def push_challenge_update(bot: Bot, challenge_id: int, *, from_timer: bool
         # Любая НЕтаймерная перерисовка (выбор дисциплины, "Нет" на подтверждении
         # и т.п.) возвращает обычный вид карточки - экран подтверждения закрыт.
         _giveup_confirm_until.pop(challenge_id, None)
+        _ease_confirm_until.pop(challenge_id, None)
 
-    progress_rows = await db.get_progress_rows(challenge_id)
-    text = await _build_text(challenge, progress_rows)
-    markup = _build_keyboard(challenge, progress_rows)
+    text, markup = await _render_card(challenge)
 
     try:
         await bot.edit_message_text(
@@ -323,6 +368,44 @@ async def push_giveup_confirm(bot: Bot, challenge_id: int):
         _giveup_confirm_until[challenge_id] = time.monotonic() + _GIVEUP_CONFIRM_TTL_SECONDS
     except Exception as e:
         logger.info("Не удалось показать подтверждение сдачи %s: %s", challenge_id, e)
+
+
+def _ease_confirm_text(progress_rows: list[dict]) -> str:
+    lines = ["📉 Снизить сложность?", "", "Цели на сегодня станут вдвое меньше:"]
+    for p in progress_rows:
+        lines.append(f"{FOCUS_OPTIONS[p['focus']]['label']}: {p['target']} → {eased_target(p['target'])}")
+    lines += [
+        "",
+        "• Награда за испытание — половина XP.",
+        "• Секретное испытание сегодня станет недоступно.",
+        "• Серия сохранится.",
+        "",
+        "Отменить это уже нельзя.",
+    ]
+    return "\n".join(lines)
+
+
+async def push_ease_confirm(bot: Bot, challenge_id: int):
+    """
+    Подменяет карточку испытания на экран подтверждения снижения сложности: цели "было → станет",
+    что изменится, и кнопки "Да"/"Нет" (keyboards.confirm_ease_kb). Как и экран "Сдаться?", это
+    правка единственного сообщения испытания - нового сообщения не создаётся; "Нет" возвращает
+    обычную карточку (кнопка снижения сложности остаётся), "Да" - см. handlers/challenge.py.
+    """
+    challenge = await db.get_challenge(challenge_id)
+    if not challenge or not challenge.get("message_id"):
+        return
+    progress_rows = await db.get_progress_rows(challenge_id)
+    try:
+        await bot.edit_message_text(
+            _ease_confirm_text(progress_rows),
+            chat_id=challenge["user_id"],
+            message_id=challenge["message_id"],
+            reply_markup=kb.confirm_ease_kb(challenge_id),
+        )
+        _ease_confirm_until[challenge_id] = time.monotonic() + _GIVEUP_CONFIRM_TTL_SECONDS
+    except Exception as e:
+        logger.info("Не удалось показать подтверждение снижения сложности %s: %s", challenge_id, e)
 
 
 async def close_failed_challenge(bot: Bot, challenge_id: int, failure_text: str):
@@ -492,9 +575,7 @@ async def send_challenge_message(bot: Bot, challenge_id: int):
         if await db.restart_challenge_timer(challenge_id):
             challenge = await db.get_challenge(challenge_id) or challenge
 
-    progress_rows = await db.get_progress_rows(challenge_id)
-    text = await _build_text(challenge, progress_rows)
-    markup = _build_keyboard(challenge, progress_rows)
+    text, markup = await _render_card(challenge)
 
     msg = await bot.send_message(challenge["user_id"], text, reply_markup=markup)
     await db.set_message_id(challenge_id, msg.message_id)

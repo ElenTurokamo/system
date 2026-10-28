@@ -110,7 +110,23 @@ def success(streak: int, xp_gained: int, xp: int, level: int) -> str:
     return _compose("success", streak=streak, xp_gained=xp_gained, xp=xp, level=level)
 
 
-def photo_caption(streak: int, user_id: int, physical_bonus_claimed: bool = False) -> str:
+# Пометка о том, что в этот день игрок воспользовался "📉 Снизить сложность" - показывается в
+# профиле и в отчёте для группы (см. photo_caption, ease_note).
+EASED_NOTE = "📉 Сложность в этот день была понижена."
+
+
+def ease_note(streak: int, user_id: int) -> str:
+    """
+    Короткое дополнение к отчёту в группу: фото-отчёт за этот день уже ушёл (игрок закрыл
+    физические цели до снижения сложности), а испытание завершено уже со сниженной
+    сложностью - друзья должны увидеть пометку.
+    """
+    return f"Отчёт дня {streak}. Игрок {user_id}.\n\n{EASED_NOTE}"
+
+
+def photo_caption(
+    streak: int, user_id: int, physical_bonus_claimed: bool = False, eased: bool = False
+) -> str:
     """
     Ежедневный отчёт в группу (подпись к фото выполнения физических дисциплин).
     Формат жёстко фиксирован - без "воды" из банка случайных фраз (как и у
@@ -126,7 +142,11 @@ def photo_caption(streak: int, user_id: int, physical_bonus_claimed: bool = Fals
     задерживать фото-отчёт ради шахмат/чтения, пока не прошёл памп.
     """
     text = f"Отчёт дня {streak}. Игрок {user_id} завершил испытание."
-    if physical_bonus_claimed:
+    # При сниженной сложности секретное испытание недоступно, поэтому обе строки
+    # взаимоисключающие (флаги x2 при понижении сбрасываются - Database.ease_challenge).
+    if eased:
+        text += f"\n\n{EASED_NOTE}"
+    elif physical_bonus_claimed:
         text += f"\n\n🌟 В день {streak} также пройдено секретное испытание."
     return text
 

@@ -36,6 +36,7 @@ def challenge_kb(
     active_focus: str | None,
     show_finish: bool = False,
     show_skip_physical_photo: bool = False,
+    show_ease: bool = False,
 ) -> InlineKeyboardMarkup:
     rows = []
     for p in progress_rows:
@@ -79,6 +80,13 @@ def challenge_kb(
             [InlineKeyboardButton(text="🏁 Завершить испытание", callback_data=f"finish:{challenge_id}")]
         )
 
+    # Снижение сложности (см. config.EASE_*): кнопка стоит прямо над "Сдаться" и исчезает,
+    # когда все цели дня закрыты или сложность уже понижена.
+    if show_ease:
+        rows.append(
+            [InlineKeyboardButton(text="📉 Снизить сложность", callback_data=f"ease:{challenge_id}")]
+        )
+
     rows.append([InlineKeyboardButton(text="🏳 Сдаться", callback_data=f"giveup:{challenge_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -89,6 +97,17 @@ def confirm_giveup_kb(challenge_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="Да", callback_data=f"giveup_yes:{challenge_id}"),
             InlineKeyboardButton(text="Нет", callback_data=f"giveup_no:{challenge_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def confirm_ease_kb(challenge_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения снижения сложности на карточке: "Да" / "Нет"."""
+    rows = [
+        [
+            InlineKeyboardButton(text="Да", callback_data=f"ease_yes:{challenge_id}"),
+            InlineKeyboardButton(text="Нет", callback_data=f"ease_no:{challenge_id}"),
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)

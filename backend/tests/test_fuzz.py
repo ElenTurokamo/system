@@ -53,6 +53,18 @@ async def _check_invariants(s, uid_slots):
         if r["n"]:  # испытания, закрытые напрямую через db.complete_challenge в самом фаззере, строк прогресса не трогают
             assert r["n"] == (r["done"] or 0) or row["id"] in _DIRECTLY_COMPLETED, f"I11: {row['id']} выполнено без закрытых целей"
 
+    # I13: при сниженной сложности секретного испытания нет - ни бонуса, ни огоньков; кнопка
+    # снижения сложности есть только у неснижённого испытания, у которого не все цели закрыты.
+    cur = await q("SELECT id, user_id, status, bonus_claimed, message_id FROM challenges WHERE eased = 1")
+    for row in await cur.fetchall():
+        assert not row["bonus_claimed"], f"I13: у сниженного испытания {row['id']} есть секретный бонус"
+        c2 = await q("SELECT COUNT(*) n FROM challenge_progress WHERE challenge_id=? AND bonus_claimed=1", (row["id"],))
+        assert (await c2.fetchone())["n"] == 0, f"I13: огоньки у сниженного испытания {row['id']}"
+        if row["status"] == "awaiting_action" and row["message_id"]:
+            cbs = [b.callback_data for r_ in (s.bot.markups.get((row["user_id"], row["message_id"])).inline_keyboard
+                   if s.bot.markups.get((row["user_id"], row["message_id"])) else []) for b in r_]
+            assert not any(cb and cb.startswith("ease:") for cb in cbs), f"I13: кнопка снижения при eased {row['id']}"
+
     # I12: в чате у каждого игрока не больше одного сообщения профиля. Единственное
     # допустимое исключение - ограничение Telegram: если пока профилю было 42+ часа (время
     # пересоздания), игрок был заблокирован или бот не работал, профиль мог состариться
@@ -85,6 +97,11 @@ async def _scenario(s, seed, days=3):
     uid_slots = {u: rnd.choice(slots) for u in uids}
     for u in uids:
         await s.make_user(u, slot=uid_slots[u], focuses=rnd.choice([("pushups",), ("pushups", "chess")]))
+        if u >= 6:   # половина игроков - 22+ уровня: им доступна кнопка "Снизить сложность"
+            from bot.config import level_from_total_xp
+            xp = next(x for x in range(0, 200_000, 100) if level_from_total_xp(x)[0] >= 22)
+            await s.db._conn.execute("UPDATE users SET xp = ?, level = 22 WHERE user_id = ?", (xp, u))
+            await s.db._conn.commit()
 
     net_bad = {u: None for u in uids}   # None - ок, число - сколько ещё карточек уронить, -1 - всегда
 
@@ -127,6 +144,14 @@ async def _scenario(s, seed, days=3):
                 if a and a.get("message_id") and a["id"] not in _FORGOT_TO_FINISH:
                     await s.db.complete_challenge(a["id"], False)
                     _DIRECTLY_COMPLETED.add(a["id"])
+            elif 0.0104 <= r < 0.0150:            # игрок снижает сложность (запрос + "Да"), если кнопка доступна
+                a = await s.db.get_active_challenge(u)
+                if a and a.get("message_id"):
+                    from bot.handlers import challenge as _ch
+                    from tests.test_completion_guide_sim import _call as _mkcall
+                    for name, data in (("on_ease_request", f"ease:{a['id']}"), ("on_ease_confirmed", f"ease_yes:{a['id']}")):
+                        c = _mkcall(u, s.bot, data)
+                        await getattr(_ch, name)(c)
             elif r < 0.0104 and r >= 0.0100:      # игрок набрал /profile: профиль пересоздаётся в случайное время суток
                 from bot import profile as _profile
                 await _profile.resend_profile_message(s.bot, u)

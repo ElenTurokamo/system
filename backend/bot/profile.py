@@ -38,6 +38,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
+from bot import messages as tx
 from bot.config import FOCUS_OPTIONS, level_from_total_xp, settings, time_of_day_label
 from bot.database import db
 from bot.utils import RETRY_AFTER_CAP_SECONDS, call_with_retries
@@ -156,6 +157,7 @@ def render_profile_text(
     quest_done_today: bool = False,
     bonus_claimed_today: bool = False,
     history_focus_keys: set[str] | None = None,
+    eased_today: bool = False,
 ) -> str:
     level, xp_into_level, xp_needed = level_from_total_xp(user["xp"])
     time_label = time_of_day_label(user["time_of_day"]) if user["time_of_day"] else "—"
@@ -205,6 +207,9 @@ def render_profile_text(
     tail: list[str] = []
     if quest_done_today:
         tail.append("✅ Вы выполнили сегодняшний квест.")
+        if eased_today:
+            # Сложность понижена: секретного испытания в этот день нет (bonus_claimed всегда 0).
+            tail.append(tx.EASED_NOTE)
         if bonus_claimed_today:
             tail.append("✅ Вы завершили секретное испытание.")
 
@@ -291,8 +296,11 @@ async def _build_profile_text(user: dict) -> str:
         latest_challenge and latest_challenge["status"] in ("completed", "completed_with_photo")
     )
     bonus_claimed_today = bool(quest_done_today and latest_challenge.get("bonus_claimed"))
+    eased_today = bool(quest_done_today and latest_challenge.get("eased"))
     history_focus_keys = await db.get_focus_keys_with_history(user_id)
-    return render_profile_text(user, quest_done_today, bonus_claimed_today, history_focus_keys)
+    return render_profile_text(
+        user, quest_done_today, bonus_claimed_today, history_focus_keys, eased_today=eased_today
+    )
 
 
 def _is_message_gone(error_text: str) -> bool:

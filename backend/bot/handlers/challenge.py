@@ -78,11 +78,15 @@ async def on_amount_logged(message: Message):
     # секретный бонус (+5 уровней) по-прежнему считается отдельно ниже и
     # требует x2 сразу по ВСЕМ выбранным дисциплинам, и он уже одноразовый
     # (награда), поэтому его самого назад не откатываем.
-    await db.sync_progress_bonus(challenge["id"], focus_key, BONUS_MULTIPLIER)
+    # При сниженной сложности ("📉 Снизить сложность") секретного испытания сегодня нет:
+    # ни огоньков 🔥, ни бонуса - даже если повторений набрано вдвое больше новой цели.
+    eased = bool(challenge.get("eased"))
+    if not eased:
+        await db.sync_progress_bonus(challenge["id"], focus_key, BONUS_MULTIPLIER)
 
     # Секретный бонус: единоразово за ВСЁ испытание, только когда КАЖДАЯ выбранная
     # дисциплина доведена минимум до x2 своей цели - не за одну отдельную дисциплину.
-    if not challenge["bonus_claimed"]:
+    if not eased and not challenge["bonus_claimed"]:
         rows = await db.get_progress_rows(challenge["id"])
         if rows and all(r["amount"] >= r["target"] * BONUS_MULTIPLIER for r in rows):
             await db.mark_challenge_bonus_claimed(challenge["id"])
@@ -130,13 +134,15 @@ async def on_photo_received(message: Message, bot):
         # закрытия шахмат/чтения, а по мышцам прогресс тренировки оценить уже
         # не получится, памп пройдёт. Полный бонус (x2 XP) от этого никак не
         # зависит и по-прежнему даётся только при закрытии ВСЕГО испытания.
-        physical_bonus = await db.physical_bonus_achieved(challenge["id"])
+        eased = bool(challenge.get("eased"))
+        physical_bonus = (not eased) and await db.physical_bonus_achieved(challenge["id"])
         # Серия в БД увеличится только при завершении испытания, а отчёт - про текущий
         # день, поэтому +1: первый день - "день 1" (так же считает авто-отчёт, см. completion.py).
         caption = tx.photo_caption(
             user["streak"] + 1,
             message.from_user.id,
             physical_bonus_claimed=physical_bonus,
+            eased=eased,
         )
         try:
             await bot.send_photo(user["group_id"], message.photo[-1].file_id, caption=caption)
@@ -215,6 +221,80 @@ async def _execute_give_up(bot: Bot, challenge: dict):
         ),
     )
     await profile.sync_profile_message(bot, user_id)
+
+
+async def _ease_unavailable_reason(call: CallbackQuery, challenge: dict | None) -> str | None:
+    """Почему снижение сложности сейчас недоступно (None - доступно). Единая проверка для запроса и подтверждения."""
+    if not challenge or challenge["user_id"] != call.from_user.id:
+        return "Это испытание уже неактуально."
+    if challenge["status"] != "awaiting_action":
+        return "Испытание уже закрыто."
+    if challenge.get("eased"):
+        return "Сложность уже снижена."
+    user = await db.get_user(call.from_user.id)
+    rows = await db.get_progress_rows(challenge["id"])
+    if not challenge_render.ease_offered(challenge, rows, user):
+        return "Сейчас снизить сложность нельзя: все цели дня уже закрыты."
+    return None
+
+
+@router.callback_query(F.data.startswith("ease:"))
+async def on_ease_request(call: CallbackQuery):
+    """"📉 Снизить сложность": карточка подменяется экраном подтверждения Да/Нет (ничего не меняется до "Да")."""
+    challenge_id = int(call.data.split(":")[1])
+    challenge = await db.get_challenge(challenge_id)
+    reason = await _ease_unavailable_reason(call, challenge)
+    if reason:
+        await call.answer(reason, show_alert=True)
+        # Кнопка на карточке устарела (цели закрыли, уже снижено) - перерисовываем актуальный вид.
+        if challenge and challenge["user_id"] == call.from_user.id and challenge["status"] == "awaiting_action":
+            await challenge_render.push_challenge_update(call.bot, challenge_id)
+        return
+
+    await challenge_render.push_ease_confirm(call.bot, challenge_id)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ease_yes:"))
+async def on_ease_confirmed(call: CallbackQuery):
+    """
+    "Да": цели всех сегодняшних дисциплин делятся пополам, награда становится половинной,
+    секретное испытание отключается, серия не страдает (см. Database.ease_challenge и
+    completion.complete_challenge_flow). Прогресс остаётся: если набрано уже не меньше новой
+    цели, дисциплина сразу закрыта (а при всех закрытых - появляется "Завершить испытание").
+    """
+    challenge_id = int(call.data.split(":")[1])
+    challenge = await db.get_challenge(challenge_id)
+    reason = await _ease_unavailable_reason(call, challenge)
+    if reason:
+        await call.answer(reason, show_alert=True)
+        if challenge and challenge["user_id"] == call.from_user.id and challenge["status"] == "awaiting_action":
+            await challenge_render.push_challenge_update(call.bot, challenge_id)
+        return
+
+    # Условный UPDATE: двойное "Да" или "Да" вместе с завершением/просрочкой не поделят цели дважды.
+    if not await db.ease_challenge(challenge_id):
+        await call.answer("Сейчас снизить сложность нельзя.", show_alert=True)
+        await challenge_render.push_challenge_update(call.bot, challenge_id)
+        return
+
+    # Если после пересчёта все цели закрыты - предупреждение о штрафе теряет смысл.
+    if await db.goals_ready(challenge_id):
+        await challenge_render.clear_warning_message(call.bot, challenge_id)
+
+    await challenge_render.push_challenge_update(call.bot, challenge_id)
+    await profile.sync_profile_message(call.bot, call.from_user.id)
+    await call.answer("📉 Сложность снижена: цели и награда вдвое меньше.")
+
+
+@router.callback_query(F.data.startswith("ease_no:"))
+async def on_ease_declined(call: CallbackQuery):
+    """"Нет": карточка возвращается к обычному виду, кнопка снижения сложности остаётся."""
+    challenge_id = int(call.data.split(":")[1])
+    challenge = await db.get_challenge(challenge_id)
+    if challenge and challenge["user_id"] == call.from_user.id and challenge["status"] == "awaiting_action":
+        await challenge_render.push_challenge_update(call.bot, challenge_id)
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("giveup:"))

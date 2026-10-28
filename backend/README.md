@@ -146,6 +146,21 @@ A cron job runs for each of the 4 time slots (`TIME_MORNING` / `TIME_DAY` / `TIM
 </details>
 
 <details>
+<summary><strong>Lowering the difficulty ("📉 Снизить сложность")</strong></summary>
+
+<br>
+
+Around 50 push-ups a day, finishing the daily quest gets really hard, and a skipped day costs the streak. So from a certain level a button appears under the quest card:
+
+- **When:** from `EASE_UNLOCK_LEVEL` - the first level where the push-up target reaches `EASE_UNLOCK_PUSHUPS_TARGET` (50), currently **level 22** (computed in `bot/config.py` from the target curve, not hard-coded). The level is one for every discipline because all targets grow along the same curve, so "the equivalent of 50 push-ups" is simply each discipline's own target at that level: squats 50, abs 50, pull-ups 40, running 25 min, chess 3 games, reading 30 pages (`ease_equivalent_targets()`).
+- **Flow:** the card turns into a confirmation (goals "was → will be", what changes, **Да / Нет**). **Нет** restores the normal card and the button stays. **Да** is irreversible and works once per quest.
+- **Effects of "Да":** every discipline's target is halved (rounded up, minimum 1: 50→25, 55→28, 25→13, 3→2); progress already logged is kept and can close a discipline at once; the reward for the quest is **half the XP** (`eased_reward`, rounded down); the **secret quest is off** for the day - no 🔥 marks, no bonus, even at double the old norm; the **streak continues** as usual; the profile and the group report get the note "📉 Сложность в этот день была понижена" (if the photo report had already gone out before easing, a short separate note is sent at completion).
+- **Hidden when:** every goal of the day is closed, difficulty is already lowered, or the quest is closed. If progress is rolled back below the target, the button comes back.
+- **Atomic:** `Database.ease_challenge` is a conditional `UPDATE` (status, not eased, an open goal exists), so a double "Да" or "Да" together with finish/expiry can't halve the targets twice. Code: `handlers/challenge.py` (`on_ease_*`), `challenge_render.py` (`push_ease_confirm`, `ease_offered`), `completion.py` (reward, notes).
+
+</details>
+
+<details>
 <summary><strong>One profile message, always</strong></summary>
 
 <br>

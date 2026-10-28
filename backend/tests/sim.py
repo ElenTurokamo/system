@@ -75,6 +75,7 @@ class FakeBot:
         self.card_log = []      # (chat_id, message_id, utc_now)
         self.on_card_sent = None  # async-колбэк(chat_id): проверки инвариантов в момент отправки
         self.born = {}          # (chat_id, message_id) -> Clock.now в момент отправки (лимит Telegram 48 ч)
+        self.markups = {}       # (chat_id, message_id) -> актуальная inline-клавиатура сообщения
         self.profile_keys = set()   # (chat_id, message_id) всех когда-либо присланных профилей (в т.ч. удалённых)
 
     def _too_old(self, chat_id, message_id):
@@ -99,6 +100,7 @@ class FakeBot:
         self._id += 1
         self.alive[(chat_id, self._id)] = text
         self.born[(chat_id, self._id)] = Clock.now
+        self.markups[(chat_id, self._id)] = kw.get("reply_markup")
         if text.startswith("『Профиль Игрока』"):
             self.profile_keys.add((chat_id, self._id))
         self.log.append(("send_message", chat_id, {"text": text, **kw}))
@@ -134,6 +136,7 @@ class FakeBot:
         self.log.append(("edit_message_text", chat_id, {"text": text, "message_id": message_id}))
         if (chat_id, message_id) in self.alive:
             self.alive[(chat_id, message_id)] = text
+            self.markups[(chat_id, message_id)] = kw.get("reply_markup")   # edit без reply_markup снимает клавиатуру
         return Msg(message_id)
 
     async def delete_message(self, chat_id, message_id, **kw):
@@ -163,6 +166,13 @@ class FakeBot:
     def sent(self, method, chat_id):
         """Все вызовы метода в чат: список kwargs (для send_message там есть 'text')."""
         return [kw for (m, cid, kw) in self.log if m == method and cid == chat_id]
+
+    def buttons(self, chat_id, message_id):
+        """[(текст, callback_data)] по рядам клавиатуры сообщения (пусто, если клавиатуры нет)."""
+        markup = self.markups.get((chat_id, message_id))
+        if not markup:
+            return []
+        return [[(b.text, b.callback_data) for b in row] for row in markup.inline_keyboard]
 
     def profiles_alive(self, chat_id):
         """Сообщения профиля игрока, которые сейчас видны в чате (ожидается не больше одного)."""
@@ -283,6 +293,7 @@ def fresh_modules():
     import bot.scheduler as sched
     sched._stale_profile_retry_at.clear()
     import bot.challenge_render as cr
+    cr._ease_confirm_until.clear()
     cr._giveup_confirm_until.clear()
     cr._flood_until.clear()
 

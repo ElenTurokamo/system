@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
-from bot.config import FOCUS_OPTIONS, settings
+from bot.config import EASE_TARGET_DIVISOR, FOCUS_OPTIONS, settings
 
 # Статусы испытания, считающиеся провалом (штрафные).
 FAILED_STATUSES = ("expired", "gave_up")
@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS challenges (
     bonus_claimed   INTEGER DEFAULT 0,  -- секретный бонус х2 (на ВСЕ дисциплины сразу) получен
     physical_photo_done   INTEGER DEFAULT 0,  -- фото по физической части отправлено/пропущено
     physical_photo_posted INTEGER DEFAULT 0,  -- фото реально ушло в группу
+    eased           INTEGER DEFAULT 0,  -- сложность в этот день понижена (цели и награда x1/2, секретное испытание недоступно)
     started_at      TEXT,
     completed_at    TEXT,
     message_id      INTEGER,
@@ -212,6 +213,7 @@ class Database:
             "physical_photo_posted": "INTEGER DEFAULT 0",
             "warned_minutes": "INTEGER",
             "warning_message_id": "INTEGER",
+            "eased": "INTEGER DEFAULT 0",  # сложность в этот день понижена (см. ease_challenge)
         }
         for name, col_type in new_challenge_columns.items():
             if name not in existing_challenges:
@@ -668,6 +670,46 @@ class Database:
             (status, datetime.utcnow().isoformat(), challenge_id),
         )
         await self._conn.commit()
+
+    async def ease_challenge(self, challenge_id: int) -> bool:
+        """
+        Понижает сложность сегодняшнего испытания (кнопка "📉 Снизить сложность" после
+        подтверждения "Да"). Необратимо и один раз за испытание:
+
+          * цели ВСЕХ дисциплин дня делятся на EASE_TARGET_DIVISOR (вверх, не меньше 1);
+            уже набранные повторения остаются, флаги completed пересчитываются по новым
+            целям (дисциплина, где набрано больше новой цели, сразу становится закрытой);
+          * личные метки 🔥 (x2 по дисциплине) сбрасываются: секретное испытание в этот
+            день недоступно, даже при x2 от новой (или прежней) нормы. Сам challenges.bonus_claimed
+            тут всегда 0: x2 по ВСЕМ дисциплинам означало бы, что все цели уже закрыты, а
+            тогда понижение недоступно (см. условие ниже).
+
+        Условный UPDATE (статус, ещё не понижено, остались незакрытые цели) решает гонку
+        двойного нажатия "Да" и нажатия вместе с завершением/просрочкой: целей не
+        поделят дважды. False - ничего не изменилось.
+        """
+        d = EASE_TARGET_DIVISOR
+        cur = await self._conn.execute(
+            """UPDATE challenges SET eased = 1, active_focus = NULL
+               WHERE id = ? AND status = 'awaiting_action' AND COALESCE(eased, 0) = 0
+                 AND EXISTS (SELECT 1 FROM challenge_progress WHERE challenge_id = ? AND completed = 0)""",
+            (challenge_id, challenge_id),
+        )
+        if cur.rowcount == 0:
+            await self._conn.commit()
+            return False
+        # Выражения справа в UPDATE вычисляются по СТАРОЙ строке: (target + d - 1) / d - это
+        # деление вверх, а completed считается уже по новой цели.
+        await self._conn.execute(
+            """UPDATE challenge_progress
+               SET completed = CASE WHEN amount >= MAX(1, (target + ? - 1) / ?) THEN 1 ELSE 0 END,
+                   target = MAX(1, (target + ? - 1) / ?),
+                   bonus_claimed = 0
+               WHERE challenge_id = ?""",
+            (d, d, d, d, challenge_id),
+        )
+        await self._conn.commit()
+        return True
 
     async def complete_challenge_if_ready(self, challenge_id: int) -> bool:
         """
