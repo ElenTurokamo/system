@@ -50,8 +50,9 @@ CREATE TABLE IF NOT EXISTS challenges (
     quest_text      TEXT,   -- исходный текст испытания (не меняется, к нему дописывается футер)
     active_focus    TEXT,   -- какой фокус сейчас выбран (принимает числа)
     bonus_claimed   INTEGER DEFAULT 0,  -- секретный бонус х2 (на ВСЕ дисциплины сразу) получен
-    physical_photo_done   INTEGER DEFAULT 0,  -- фото по физической части отправлено/пропущено
-    physical_photo_posted INTEGER DEFAULT 0,  -- фото реально ушло в группу
+    physical_photo_done   INTEGER DEFAULT 0,  -- фото по физической части получено/пропущено
+    physical_photo_posted INTEGER DEFAULT 0,  -- фото реально ушло в группу (при завершении испытания)
+    physical_photo_file_id TEXT,              -- file_id полученного фото: хранится до завершения, в группу уходит только с отчётом
     eased           INTEGER DEFAULT 0,  -- сложность в этот день понижена (цели и награда x1/2, секретное испытание недоступно)
     started_at      TEXT,
     completed_at    TEXT,
@@ -211,6 +212,7 @@ class Database:
             "bonus_claimed": "INTEGER DEFAULT 0",
             "physical_photo_done": "INTEGER DEFAULT 0",
             "physical_photo_posted": "INTEGER DEFAULT 0",
+            "physical_photo_file_id": "TEXT",
             "warned_minutes": "INTEGER",
             "warning_message_id": "INTEGER",
             "eased": "INTEGER DEFAULT 0",  # сложность в этот день понижена (см. ease_challenge)
@@ -656,10 +658,37 @@ class Database:
         )
         await self._conn.commit()
 
-    async def mark_physical_photo(self, challenge_id: int, posted: bool):
+    async def store_physical_photo(self, challenge_id: int, file_id: str) -> bool:
+        """
+        Сохраняет фото выполнения физических дисциплин. В группу оно НЕ уходит сразу:
+        отчёт (с фото) публикуется только при завершении испытания (bot/completion.py).
+
+        Условный UPDATE (фото ещё не получено и не пропущено) делает сохранение атомарным:
+        два фото, пришедшие почти одновременно (альбом), не перезапишут друг друга, а фото
+        после «Пропустить фото» игнорируется. True - фото сохранено именно этим вызовом.
+        """
+        cur = await self._conn.execute(
+            "UPDATE challenges SET physical_photo_done = 1, physical_photo_file_id = ? "
+            "WHERE id = ? AND status = 'awaiting_action' AND COALESCE(physical_photo_done, 0) = 0",
+            (file_id, challenge_id),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    async def skip_physical_photo(self, challenge_id: int) -> bool:
+        """«Пропустить фото»: фото по физической части не будет. False - уже получено/пропущено."""
+        cur = await self._conn.execute(
+            "UPDATE challenges SET physical_photo_done = 1 "
+            "WHERE id = ? AND status = 'awaiting_action' AND COALESCE(physical_photo_done, 0) = 0",
+            (challenge_id,),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    async def mark_physical_photo_posted(self, challenge_id: int):
+        """Фото реально ушло в группу вместе с отчётом о завершении."""
         await self._conn.execute(
-            "UPDATE challenges SET physical_photo_done = 1, physical_photo_posted = ? WHERE id = ?",
-            (int(posted), challenge_id),
+            "UPDATE challenges SET physical_photo_posted = 1 WHERE id = ?", (challenge_id,)
         )
         await self._conn.commit()
 
@@ -719,12 +748,13 @@ class Database:
         поэтому гонки невозможны: ручное "Завершить", авто-завершение по таймауту,
         "Сдаться" и просрочка не могут закрыть одно и то же испытание дважды, а
         прогресс, откаченный отрицательным числом за миг до этого, не будет
-        засчитан. Статус - completed_with_photo, если фото уже ушло в группу.
+        засчитан. Статус - completed_with_photo, если игрок присылал фото (оно уходит в
+        группу уже после этого - вместе с отчётом, см. bot/completion.py).
         True - именно этот вызов закрыл испытание (и только он должен начислять награду).
         """
         cur = await self._conn.execute(
             """UPDATE challenges
-               SET status = CASE WHEN physical_photo_posted = 1
+               SET status = CASE WHEN physical_photo_file_id IS NOT NULL
                                  THEN 'completed_with_photo' ELSE 'completed' END,
                    active_focus = NULL,
                    completed_at = ?
@@ -743,12 +773,19 @@ class Database:
         Закрывает испытание как 'gave_up', но ТОЛЬКО если оно всё ещё
         awaiting_action (защита от двойного нажатия "Да" и от гонки с
         планировщиком, который в ту же секунду мог его просрочить - иначе
-        штраф и счётчик провалов засчитались бы дважды). True - статус сменился.
+        штраф и счётчик провалов засчитались бы дважды) И закрыты НЕ все цели дня:
+        когда все ежедневные активности выполнены, кнопки "Сдаться" на карточке уже
+        нет (challenge_render._build_keyboard), и устаревшая кнопка/экран подтверждения
+        не должны сдать выполненное испытание. Условие - отрицание goals_ready:
+        сдаться можно, если строк прогресса нет вовсе или есть незакрытая цель.
+        True - статус сменился.
         """
         cur = await self._conn.execute(
             "UPDATE challenges SET status = 'gave_up', active_focus = NULL, completed_at = ? "
-            "WHERE id = ? AND status = 'awaiting_action'",
-            (datetime.utcnow().isoformat(), challenge_id),
+            "WHERE id = ? AND status = 'awaiting_action' "
+            "AND (NOT EXISTS (SELECT 1 FROM challenge_progress WHERE challenge_id = ?) "
+            "     OR EXISTS (SELECT 1 FROM challenge_progress WHERE challenge_id = ? AND completed = 0))",
+            (datetime.utcnow().isoformat(), challenge_id, challenge_id, challenge_id),
         )
         await self._conn.commit()
         return cur.rowcount > 0

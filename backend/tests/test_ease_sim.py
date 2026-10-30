@@ -406,25 +406,31 @@ def test_photo_report_after_easing_has_the_note_and_no_secret_line():
         photo = _message(1, s.bot)
         photo.photo = [MagicMock(file_id="P")]
         await h.on_photo_received(photo, s.bot)
+        assert s.bot.sent("send_photo", GROUP) == []                      # фото ждёт завершения
+        await log(s, 1, ch["id"], "reading", 15)
+        await h.on_finish_challenge(_call(1, s.bot, f"finish:{ch['id']}"))
         caption = s.bot.sent("send_photo", GROUP)[0]["caption"]
         assert caption == f"Отчёт дня 1. Игрок 1 завершил испытание.\n\n{EASED_NOTE}"
         assert "🌟" not in caption
     sim.run(sc)
 
 
-def test_photo_sent_before_easing_gets_a_separate_note_at_completion():
+def test_photo_sent_before_easing_goes_at_completion_with_the_note_in_its_caption():
+    """Раньше фото уходило сразу и пометку приходилось досылать отдельным сообщением - теперь не нужно."""
     async def sc(s):
         from bot.handlers import challenge as h
         ch = await setup_ease_quest(s, focuses=("pushups", "reading"))
         await log(s, 1, ch["id"], "pushups", 50)
         photo = _message(1, s.bot)
         photo.photo = [MagicMock(file_id="P")]
-        await h.on_photo_received(photo, s.bot)                                    # фото ушло, пометки в нём нет
-        assert EASED_NOTE not in s.bot.sent("send_photo", GROUP)[0]["caption"]
+        await h.on_photo_received(photo, s.bot)                                    # фото сохранено, группа молчит
+        assert s.bot.sent("send_photo", GROUP) == []
         await ease_yes(s, ch)
         await log(s, 1, ch["id"], "reading", 15)
         await h.on_finish_challenge(_call(1, s.bot, f"finish:{ch['id']}"))
-        assert group_texts(s) == [f"Отчёт дня 1. Игрок 1.\n\n{EASED_NOTE}"]
+        sent = s.bot.sent("send_photo", GROUP)
+        assert len(sent) == 1 and sent[0]["caption"] == f"Отчёт дня 1. Игрок 1 завершил испытание.\n\n{EASED_NOTE}"
+        assert group_texts(s) == []                                                # отдельной пометки нет
         assert await status_of(s, ch["id"]) == "completed_with_photo"
     sim.run(sc)
 

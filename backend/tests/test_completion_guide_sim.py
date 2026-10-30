@@ -219,7 +219,10 @@ def test_unfinished_goals_still_fail_exactly_as_before():
         assert (u["xp"], u["streak"], u["consecutive_failures"]) == (200, 0, 1)
         assert u["penalty_until"] is not None
         assert len(failure_pushes(s, 1)) == 1
-        assert group_texts(s) == []                      # провал в группу не шлётся
+        # В группу уходит ровно одно сообщение о поражении (серия 3 дня была сброшена).
+        assert len(group_texts(s)) == 1
+        assert "Игрок 1 потерпел поражение." in group_texts(s)[0]
+        assert "Серия из 3 дней: сброшена" in group_texts(s)[0]
         assert "✅ Вы выполнили сегодняшний квест." not in await profile_text(s, 1)
     sim.run(sc)
 
@@ -234,7 +237,11 @@ def test_nine_of_ten_fails_and_rollback_below_target_fails():
         await s.until(DEADLINE)
         assert await status_of(s, ch1["id"]) == "expired"
         assert await status_of(s, ch2["id"]) == "expired"
-        assert group_texts(s) == []
+        # Отчётов о выполнении нет - только по одному сообщению о поражении на игрока.
+        texts = group_texts(s)
+        assert len(texts) == 2 and all("потерпел поражение" in x for x in texts)
+        assert not any("завершил испытание" in x for x in texts)
+        assert s.bot.sent("send_photo", GROUP) == []
     sim.run(sc)
 
 
@@ -252,11 +259,11 @@ def test_gave_up_and_stopped_challenges_are_not_touched():
     async def sc(s):
         from bot.handlers import challenge as h
         ch = await setup_quest(s)
-        await log(s, 1, ch["id"], "pushups", 10)
-        await h._execute_give_up(s.bot, await s.db.get_challenge(ch["id"]))
+        await log(s, 1, ch["id"], "pushups", 5)             # цель (10) не закрыта - сдаться можно
+        assert await h._execute_give_up(s.bot, await s.db.get_challenge(ch["id"])) is True
         await s.until(DEADLINE)
         assert await status_of(s, ch["id"]) == "gave_up"
-        assert group_texts(s) == []
+        assert len(group_texts(s)) == 1 and "потерпел поражение" in group_texts(s)[0]   # ровно одно, без дублей по таймауту
         assert (await s.db.get_user(1))["streak"] == 0
     sim.run(sc)
 
@@ -275,18 +282,23 @@ def test_no_group_bound_completes_silently():
     sim.run(sc)
 
 
-def test_photo_already_sent_to_group_is_not_duplicated_by_text_report():
+def test_photo_is_kept_until_completion_and_then_sent_once_without_text_duplicate():
     async def sc(s):
         from bot.handlers import challenge as h
         ch = await setup_quest(s)
         await log(s, 1, ch["id"], "pushups", 10)
         photo = _message(1, s.bot)
         photo.photo = [MagicMock(file_id="PHOTO_ID")]
-        await h.on_photo_received(photo, s.bot)                 # реальный хендлер: фото ушло в группу
-        assert len(s.bot.sent("send_photo", GROUP)) == 1
-        await s.until(DEADLINE)
+        await h.on_photo_received(photo, s.bot)                 # реальный хендлер: фото только сохранено
+        assert s.bot.sent("send_photo", GROUP) == [] and group_texts(s) == []
+        assert (await s.db.get_challenge(ch["id"]))["physical_photo_file_id"] == "PHOTO_ID"
+        await s.until(DEADLINE)                                 # авто-завершение: фото уходит в группу
         assert await status_of(s, ch["id"]) == "completed_with_photo"
-        assert group_texts(s) == []                              # второго отчёта нет
+        sent = s.bot.sent("send_photo", GROUP)
+        assert len(sent) == 1 and sent[0]["photo"] == "PHOTO_ID"
+        assert sent[0]["caption"] == "Отчёт дня 1. Игрок 1 завершил испытание."
+        assert group_texts(s) == []                              # второго (текстового) отчёта нет
+        assert (await s.db.get_challenge(ch["id"]))["physical_photo_posted"] == 1
         assert (await s.db.get_user(1))["xp"] == 100
         assert "✅ Вы выполнили сегодняшний квест." in await profile_text(s, 1)
     sim.run(sc)
@@ -1008,9 +1020,10 @@ def test_photo_report_and_auto_report_number_days_the_same_way_from_one():
         photo = _message(1, s.bot)
         photo.photo = [MagicMock(file_id="P")]
         await h.on_photo_received(photo, s.bot)                  # игрок 1 прислал фото, игрок 2 - нет
+        assert s.bot.sent("send_photo", GROUP) == [] and group_texts(s) == []   # до завершения - тишина
+        await s.until(DEADLINE)
         cap = s.bot.sent("send_photo", GROUP)[0]["caption"]
         assert cap == "Отчёт дня 3. Игрок 1 завершил испытание.\n\n🌟 В день 3 также пройдено секретное испытание."
-        await s.until(DEADLINE)
         assert group_texts(s) == [
             "Отчёт дня 3. Игрок 2 завершил испытание.\n\n🌟 В день 3 также пройдено секретное испытание."
         ]
@@ -1025,5 +1038,7 @@ def test_first_ever_report_is_day_one():
         photo = _message(1, s.bot)
         photo.photo = [MagicMock(file_id="P")]
         await h.on_photo_received(photo, s.bot)
+        assert s.bot.sent("send_photo", GROUP) == []             # фото ждёт завершения
+        await h.on_finish_challenge(_call(1, s.bot, f"finish:{ch['id']}"))
         assert s.bot.sent("send_photo", GROUP)[0]["caption"] == "Отчёт дня 1. Игрок 1 завершил испытание."
     sim.run(sc)

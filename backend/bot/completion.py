@@ -1,5 +1,5 @@
 """
-Завершение ежедневного испытания - единая точка начисления награды.
+Завершение ежедневного испытания - единая точка начисления награды и отчёта в группу.
 
 Испытание закрывается как выполненное двумя путями:
   * вручную - игрок нажал "🏁 Завершить испытание" (handlers/challenge.py);
@@ -10,17 +10,23 @@
 Оба пути идут через complete_challenge_flow, поэтому награда (XP, серия, сброс
 счётчика провалов, строка статистики, обновление карточки и профиля) выглядит
 одинаково, а повторное/параллельное срабатывание (двойное нажатие кнопки, кнопка
-в ту же секунду, что и таймаут, "Сдаться" рядом с таймаутом) не может начислить
-её дважды: решающий шаг - атомарный условный UPDATE в
-Database.complete_challenge_if_ready.
+в ту же секунду, что и таймаут) не может начислить её дважды: решающий шаг -
+атомарный условный UPDATE в Database.complete_challenge_if_ready ("Сдаться"
+после закрытия всех целей невозможно - см. Database.give_up_challenge).
 
-Отличие авто-пути: фото игрок уже не пришлёт, поэтому в привязанную группу
-текстом уходит тот же отчёт, что обычно стоит под фото
-(messages.photo_caption). Если фото-отчёт в группу уже ушёл - второй не шлётся.
+Отчёт в привязанную группу (включая фото) отправляется ТОЛЬКО здесь, после
+завершения испытания, - ни при получении фото, ни раньше. Фото, присланное по
+физическим целям, до этого момента лежит в БД (challenges.physical_photo_file_id):
+  * есть фото - в группу уходит фото с подписью-отчётом (messages.photo_caption);
+  * фото нет, завершение автоматическое - тот же отчёт уходит текстом;
+  * фото нет, завершение ручное - отчёта нет (игрок сам пропустил фото).
+Проваленное, сданное или остановленное испытание отчёта о выполнении не даёт: фото
+в группу не уходит никогда (о провале в группу пишет failure_policy.post_failure_report).
 """
 import logging
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramForbiddenError
 
 from bot import challenge_render, profile
 from bot import messages as tx
@@ -35,9 +41,9 @@ async def complete_challenge_flow(bot: Bot, challenge: dict, *, auto: bool = Fal
     """
     Закрывает испытание как выполненное и начисляет награду.
 
-    auto=True - авто-завершение по таймауту: дополнительно шлёт в группу текстовый
-    отчёт (без фото). Возвращает False, если закрывать нечего: испытание уже
-    закрыто другим путём (завершено/сдано/просрочено/остановлено) или не все цели
+    auto=True - авто-завершение по таймауту: если фото нет, отчёт в группу всё равно уходит
+    текстом (см. _post_group_report). Возвращает False, если закрывать нечего: испытание
+    уже закрыто другим путём (завершено/сдано/просрочено/остановлено) или не все цели
     закрыты - тогда ничего не меняется и ничего не начисляется.
     """
     challenge_id = challenge["id"]
@@ -54,8 +60,7 @@ async def complete_challenge_flow(bot: Bot, challenge: dict, *, auto: bool = Fal
     eased = bool(fresh and fresh.get("eased"))
     if eased:
         reward = eased_reward(reward)
-    # Номер дня в отчёте группы - серия С УЧЁТОМ этого дня, как и в фото-отчёте
-    # (handlers/challenge.py::on_photo_received): первый день - "день 1".
+    # Номер дня в отчёте группы - серия С УЧЁТОМ этого дня: первый день - "день 1".
     report_day = user["streak"] + 1
 
     await db.add_xp(user_id, reward)
@@ -74,69 +79,70 @@ async def complete_challenge_flow(bot: Bot, challenge: dict, *, auto: bool = Fal
     # убирается вместе с ней (см. challenge_render.push_challenge_update).
     await challenge_render.push_challenge_update(bot, challenge_id)
 
-    # Отчёт в группу идёт ДО обновления профиля: профиль при сбоях edit ждёт
-    # повторных попыток по 30 с, и друзья не должны ждать отчёта из-за этого.
-    if auto:
-        await _post_auto_report(bot, challenge_id, user_id, report_day)
-    elif eased and fresh.get("physical_photo_posted"):
-        # Фото-отчёт ушёл ДО снижения сложности и пометки в нём нет - дополняем отдельным сообщением.
-        await _post_ease_note(bot, user_id, report_day)
+    # Отчёт в группу (с фото, если оно было) идёт ДО обновления профиля: профиль при
+    # сбоях edit ждёт повторных попыток по 30 с, и друзья не должны ждать отчёта из-за этого.
+    await _post_group_report(bot, challenge_id, user_id, report_day, auto=auto)
 
     await profile.sync_profile_message(bot, user_id)
     return True
 
 
-async def _post_auto_report(bot: Bot, challenge_id: int, user_id: int, report_day: int) -> None:
+async def _post_group_report(
+    bot: Bot, challenge_id: int, user_id: int, report_day: int, *, auto: bool
+) -> None:
     """
-    Текстовый отчёт о завершении в привязанную группу (без фото). Любой сбой
-    только логируется: испытание уже засчитано, и из-за недоступной группы
-    (бот удалён/нет прав) игрок терять ничего не должен.
+    Отчёт о завершении в привязанную группу: фото с подписью (если игрок прислал фото) либо
+    текст (только при авто-завершении). Любой сбой только логируется: испытание уже
+    засчитано, и из-за недоступной группы (бот удалён/нет прав) игрок терять ничего не должен.
+    Вызывается один раз - только тем вызовом complete_challenge_flow, который закрыл испытание.
     """
     try:
         challenge = await db.get_challenge(challenge_id)
-        if not challenge or challenge.get("physical_photo_posted"):
-            return  # отчёт с фото в группе уже есть - дубль не нужен
+        if not challenge:
+            return
+        file_id = challenge.get("physical_photo_file_id")
+        if not file_id and not auto:
+            return  # ручное завершение без фото - отчёта нет (как и раньше)
 
         user = await db.get_user(user_id)
         if not user or not user.get("group_id"):
-            return
+            return  # группа не привязана (или отвязана после фото) - отправлять некуда
+        group_id = user["group_id"]
 
         # Строка про секретное испытание: личный x2 по всем физическим дисциплинам
-        # (как в фото-отчёте) либо общий секретный бонус - x2 по всем дисциплинам,
-        # включая интеллектуальные (его же показывает профиль). Второе нужно для
-        # испытаний только из шахмат/чтения: у них физических дисциплин нет.
+        # либо общий секретный бонус - x2 по всем дисциплинам, включая интеллектуальные
+        # (его же показывает профиль). Второе нужно для испытаний только из шахмат/чтения:
+        # у них физических дисциплин нет. Оценивается на момент завершения, а не получения фото.
         # При сниженной сложности секретного испытания нет (флаги сброшены), строка заменяется пометкой.
         eased = bool(challenge.get("eased"))
         secret = not eased and (
             bool(challenge.get("bonus_claimed")) or await db.physical_bonus_achieved(challenge_id)
         )
-
-        # Тот же текст, что под фото (messages.photo_caption), и тот же отсчёт дней.
         text = tx.photo_caption(report_day, user_id, physical_bonus_claimed=secret, eased=eased)
-        group_id = user["group_id"]
+
+        if file_id:
+            try:
+                await call_with_retries(
+                    lambda: bot.send_photo(group_id, file_id, caption=text),
+                    attempts=3,
+                    delay=settings.profile_retry_delay_seconds,
+                    what=f"фото-отчёт о завершении испытания {challenge_id}",
+                )
+                await db.mark_physical_photo_posted(challenge_id)
+                return
+            except TelegramForbiddenError:
+                raise  # бота выгнали из группы - текст тоже не дойдёт
+            except Exception as e:  # noqa: BLE001
+                # Фото не ушло - друзья всё равно должны узнать о завершении: шлём тот же отчёт текстом.
+                logger.warning(
+                    "Не удалось отправить фото-отчёт (испытание %s), шлём текстом: %s", challenge_id, e
+                )
+
         await call_with_retries(
             lambda: bot.send_message(group_id, text),
             attempts=3,
             delay=settings.profile_retry_delay_seconds,
-            what=f"авто-отчёт о завершении испытания {challenge_id}",
+            what=f"отчёт о завершении испытания {challenge_id}",
         )
     except Exception as e:  # noqa: BLE001 - сбой группы не должен ломать завершение
-        logger.warning("Не удалось отправить авто-отчёт в группу (испытание %s): %s", challenge_id, e)
-
-
-async def _post_ease_note(bot: Bot, user_id: int, report_day: int) -> None:
-    """Короткая пометка про сниженную сложность в группу (если фото-отчёт уже был без неё). Сбои только логируются."""
-    try:
-        user = await db.get_user(user_id)
-        if not user or not user.get("group_id"):
-            return
-        group_id = user["group_id"]
-        text = tx.ease_note(report_day, user_id)
-        await call_with_retries(
-            lambda: bot.send_message(group_id, text),
-            attempts=3,
-            delay=settings.profile_retry_delay_seconds,
-            what=f"пометка о сниженной сложности игрока {user_id}",
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Не удалось отправить пометку о сниженной сложности в группу (игрок %s): %s", user_id, e)
+        logger.warning("Не удалось отправить отчёт в группу (испытание %s): %s", challenge_id, e)

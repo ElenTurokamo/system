@@ -37,6 +37,7 @@ def challenge_kb(
     show_finish: bool = False,
     show_skip_physical_photo: bool = False,
     show_ease: bool = False,
+    show_giveup: bool = True,
 ) -> InlineKeyboardMarkup:
     rows = []
     for p in progress_rows:
@@ -87,7 +88,10 @@ def challenge_kb(
             [InlineKeyboardButton(text="📉 Снизить сложность", callback_data=f"ease:{challenge_id}")]
         )
 
-    rows.append([InlineKeyboardButton(text="🏳 Сдаться", callback_data=f"giveup:{challenge_id}")])
+    # Когда все ежедневные активности выполнены, сдаваться уже незачем: кнопка убирается
+    # (см. challenge_render._build_keyboard). Если игрок откатит прогресс ниже цели - вернётся.
+    if show_giveup:
+        rows.append([InlineKeyboardButton(text="🏳 Сдаться", callback_data=f"giveup:{challenge_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

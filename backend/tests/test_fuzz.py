@@ -16,6 +16,8 @@ _DIRECTLY_COMPLETED: set[int] = set()
 # id испытаний, где игрок закрыл все цели, но "Завершить" не нажал: фаззер сам их не закрывает,
 # их должно подобрать авто-завершение по таймауту (если раньше не сработал /stop).
 _FORGOT_TO_FINISH: set[int] = set()
+# группа каждого игрока (id чата) - для инвариантов про отчёты и сообщения о поражении.
+_GROUPS: dict[int, int] = {}
 # сообщения профиля, которые бот не мог обновить вовремя (игрок заблокирован/бот выключен в окне 42-48 ч).
 _PROFILE_UNREACHABLE: set[tuple[int, int]] = set()
 
@@ -60,10 +62,15 @@ async def _check_invariants(s, uid_slots):
         assert not row["bonus_claimed"], f"I13: у сниженного испытания {row['id']} есть секретный бонус"
         c2 = await q("SELECT COUNT(*) n FROM challenge_progress WHERE challenge_id=? AND bonus_claimed=1", (row["id"],))
         assert (await c2.fetchone())["n"] == 0, f"I13: огоньки у сниженного испытания {row['id']}"
-        if row["status"] == "awaiting_action" and row["message_id"]:
+        # Заблокировавший бота игрок кнопок не жмёт, а правка его карточки невозможна (Forbidden):
+        # разметка у него может быть устаревшей - фаззер же вызывает хендлеры независимо от блокировки.
+        if row["status"] == "awaiting_action" and row["message_id"] and row["user_id"] not in s.bot.blocked:
             cbs = [b.callback_data for r_ in (s.bot.markups.get((row["user_id"], row["message_id"])).inline_keyboard
                    if s.bot.markups.get((row["user_id"], row["message_id"])) else []) for b in r_]
-            assert not any(cb and cb.startswith("ease:") for cb in cbs), f"I13: кнопка снижения при eased {row['id']}"
+            assert not any(cb and cb.startswith("ease:") for cb in cbs), (
+                f"I13: кнопка снижения при eased {row['id']}; cron_down={s.cron_down} blocked={row['user_id'] in s.bot.blocked} "
+                f"buttons={cbs} now={Clock.now}"
+            )
 
     # I12: в чате у каждого игрока не больше одного сообщения профиля. Единственное
     # допустимое исключение - ограничение Telegram: если пока профилю было 42+ часа (время
@@ -80,6 +87,66 @@ async def _check_invariants(s, uid_slots):
             stuck = [k for k in alive if k != newest and k not in _PROFILE_UNREACHABLE]
             assert not stuck, f"I12: у игрока {uid} дубль профиля {stuck} в чате в {Clock.now}"
 
+
+    # I14: у карточки с ЗАКРЫТЫМИ целями нет кнопки "Сдаться" (и есть "Завершить"), а у
+    # карточки с открытой целью "Сдаться" есть. Проверяется только когда перерисовка возможна:
+    # игрок не заблокировал бота и до провала больше 15 минут (там карточку обновляет отдельная
+    # джоба, которой в минутном тикере нет).
+    from bot import challenge_render as _cr
+    cur = await q("SELECT * FROM challenges WHERE status='awaiting_action' AND message_id IS NOT NULL")
+    for row in await cur.fetchall():
+        row = dict(row)
+        if s.cron_down or row["user_id"] in s.bot.blocked or _cr.in_final_countdown(row):
+            continue   # бот "выключен" (карточки не перерисовываются) / заблокирован / финальный отсчёт
+        left = _cr.seconds_left(row)
+        if left is not None and left <= 0:
+            continue
+        markup = s.bot.markups.get((row["user_id"], row["message_id"]))
+        if markup is None:
+            continue
+        cbs = [b.callback_data for r_ in markup.inline_keyboard for b in r_]
+        rows_ = await db.get_progress_rows(row["id"])
+        all_done = bool(rows_) and all(p["completed"] for p in rows_)
+        has_giveup = any(cb and cb.startswith("giveup:") for cb in cbs)
+        confirm = any(cb and cb.startswith("giveup_yes:") for cb in cbs)
+        if not confirm:
+            assert has_giveup != all_done, (
+                f"I14: кнопка Сдаться/цели не согласованы у {row['id']} (все закрыты={all_done}); "
+                f"cron_down={s.cron_down} only_down={s.cron_only_down} forgot={row['id'] in _FORGOT_TO_FINISH} "
+                f"gu_conf={_cr._giveup_confirm_active(row['id'])} ease_conf={_cr._ease_confirm_active(row['id'])} "
+                f"buttons={cbs} text={s.bot.alive.get((row['user_id'], row['message_id']))!r}"
+            )
+
+    # I15: проваленные/сданные испытания не отправляли фото в группу; фото ушло -> оно было и статус "с фото".
+    cur = await q("SELECT id FROM challenges WHERE status IN ('expired','gave_up') AND COALESCE(physical_photo_posted,0)=1")
+    assert not await cur.fetchall(), "I15: фото проваленного испытания ушло в группу"
+    cur = await q("SELECT id FROM challenges WHERE COALESCE(physical_photo_posted,0)=1 "
+                  "AND (physical_photo_file_id IS NULL OR status <> 'completed_with_photo')")
+    assert not await cur.fetchall(), "I15: posted без фото/статуса completed_with_photo"
+
+    # I16: сдаться можно только при незакрытой цели (или без строк прогресса).
+    cur = await q("SELECT id FROM challenges WHERE status='gave_up'")
+    for row in await cur.fetchall():
+        c2 = await q("SELECT COUNT(*) n, SUM(completed) done FROM challenge_progress WHERE challenge_id=?", (row["id"],))
+        r = await c2.fetchone()
+        assert not (r["n"] and r["n"] == (r["done"] or 0)), f"I16: сдано испытание {row['id']} с закрытыми целями"
+
+    # I17: в группе игрока сообщений о поражении не больше, чем проваленных испытаний, фото-отчётов
+    # не больше, чем выполненных, а число ушедших фото равно числу posted=1 (ничего не дублируется).
+    for uid, gid in _GROUPS.items():
+        cur = await q("SELECT COUNT(*) n FROM challenges WHERE user_id=? AND status IN ('expired','gave_up')", (uid,))
+        failed = (await cur.fetchone())["n"]
+        defeats = [kw for kw in s.bot.sent("send_message", gid) if "потерпел поражение" in kw["text"]]
+        assert len(defeats) <= failed, f"I17: игроку {uid} {len(defeats)} сообщений о поражении при {failed} провалах"
+        cur = await q("SELECT COUNT(*) n FROM challenges WHERE user_id=? AND status IN ('completed','completed_with_photo')", (uid,))
+        done = (await cur.fetchone())["n"]
+        reports = len(s.bot.sent("send_photo", gid)) + len(
+            [kw for kw in s.bot.sent("send_message", gid) if "завершил испытание" in kw["text"]]
+        )
+        assert reports <= done, f"I17: игроку {uid} {reports} отчётов о выполнении при {done} выполненных"
+        cur = await q("SELECT COUNT(*) n FROM challenges WHERE user_id=? AND COALESCE(physical_photo_posted,0)=1", (uid,))
+        assert len(s.bot.sent("send_photo", gid)) == (await cur.fetchone())["n"], f"I17: фото игрока {uid} задублировано/потеряно"
+
     if not (s.cron_down):
         stuck = (Clock.now - timedelta(minutes=3)).isoformat()
         cur = await q("SELECT * FROM dispatch_log WHERE status='pending' AND next_attempt_at < ?", (stuck,))
@@ -90,6 +157,7 @@ async def _scenario(s, seed, days=3):
     _DIRECTLY_COMPLETED.clear()
     _FORGOT_TO_FINISH.clear()
     _PROFILE_UNREACHABLE.clear()
+    _GROUPS.clear()
     rnd = random.Random(seed)
     Clock.now = datetime(2026, 10, 22, 0, 0)
     slots = ["morning", "day", "evening", "night"]
@@ -102,6 +170,11 @@ async def _scenario(s, seed, days=3):
             xp = next(x for x in range(0, 200_000, 100) if level_from_total_xp(x)[0] >= 22)
             await s.db._conn.execute("UPDATE users SET xp = ?, level = 22 WHERE user_id = ?", (xp, u))
             await s.db._conn.commit()
+
+    for u in uids:
+        if u % 3:                            # у двух третей игроков привязана группа
+            _GROUPS[u] = -1000 - u
+            await s.db.set_group(u, _GROUPS[u])
 
     net_bad = {u: None for u in uids}   # None - ок, число - сколько ещё карточек уронить, -1 - всегда
 
@@ -162,6 +235,39 @@ async def _scenario(s, seed, days=3):
                     for p in await s.db.get_progress_rows(a["id"]):
                         await s.db.add_progress_amount(a["id"], p["focus"], p["target"])
                         await s.db.sync_progress_completed(a["id"], p["focus"])
+            elif 0.0150 <= r < 0.0185:            # "Сдаться" + "Да" реальными хендлерами
+                a = await s.db.get_active_challenge(u)
+                if a and a.get("message_id"):
+                    from bot.handlers import challenge as _ch
+                    from tests.test_completion_guide_sim import _call as _mkcall
+                    for name, data in (("on_give_up_request", f"giveup:{a['id']}"), ("on_give_up_confirmed", f"giveup_yes:{a['id']}")):
+                        await getattr(_ch, name)(_mkcall(u, s.bot, data))
+            elif 0.0185 <= r < 0.0225:            # ввод подхода (иногда отрицательный - откат) реальными хендлерами
+                a = await s.db.get_active_challenge(u)
+                if a and a.get("message_id"):
+                    from bot.handlers import challenge as _ch
+                    from tests.test_completion_guide_sim import _call as _mkcall, _message as _mkmsg
+                    p = rnd.choice(await s.db.get_progress_rows(a["id"]))
+                    await _ch.on_focus_picked(_mkcall(u, s.bot, f"focus:{a['id']}:{p['focus']}"))
+                    amount = rnd.choice([1, 3, 5, 10, 10, 20, -3, -10])
+                    await _ch.on_amount_logged(_mkmsg(u, s.bot, text=str(amount)))
+            elif 0.0225 <= r < 0.0255:            # присылает фото (сработает, только если физические цели закрыты)
+                a = await s.db.get_active_challenge(u)
+                if a and a.get("message_id"):
+                    from unittest.mock import MagicMock as _MM
+                    from bot.handlers import challenge as _ch
+                    from tests.test_completion_guide_sim import _message as _mkmsg
+                    m = _mkmsg(u, s.bot)
+                    m.photo = [_MM(file_id=f"F{u}")]
+                    await _ch.on_photo_received(m, s.bot)
+            elif 0.0255 <= r < 0.0285:            # нажимает "Завершить испытание" (сработает, только если цели закрыты)
+                a = await s.db.get_active_challenge(u)
+                if a and a.get("message_id"):
+                    from bot.handlers import challenge as _ch
+                    from tests.test_completion_guide_sim import _call as _mkcall
+                    await _ch.on_finish_challenge(_mkcall(u, s.bot, f"finish:{a['id']}"))
+            elif 0.0285 <= r < 0.0290 and u in _GROUPS:   # группа "падает"/возвращается (бота выгнали/добавили)
+                s.bot.blocked.symmetric_difference_update({_GROUPS[u]})
         if down_until is None and rnd.random() < 0.0012:
             down_until = Clock.now + timedelta(minutes=rnd.choice([5, 15, 90, 200, 400]))
             s.cron_down = rnd.random() < 0.5

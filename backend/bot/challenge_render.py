@@ -9,7 +9,11 @@
 
 Фото для физических дисциплин запрашивается СРАЗУ, как только все физические
 цели закрыты (не дожидаясь интеллектуальных) - см. _physical_photo_pending.
-Для чисто интеллектуальных испытаний фото не запрашивается вовсе.
+Для чисто интеллектуальных испытаний фото не запрашивается вовсе. Полученное фото
+только сохраняется: в группу оно уходит вместе с отчётом при завершении испытания.
+
+Кнопка "Сдаться" показывается, пока не все цели дня закрыты; как только закрыты
+все - остаётся только "Завершить испытание".
 """
 import html
 import logging
@@ -227,8 +231,15 @@ def _build_keyboard(challenge: dict, progress_rows: list[dict], show_ease: bool 
 
     show_finish = bool(progress_rows) and all(p["completed"] for p in progress_rows)
     show_skip_photo = _physical_photo_pending(challenge, progress_rows)
+    # Все цели закрыты (show_finish) - кнопки "Сдаться" нет: испытание можно только завершить.
     return kb.challenge_kb(
-        challenge["id"], progress_rows, challenge["active_focus"], show_finish, show_skip_photo, show_ease
+        challenge["id"],
+        progress_rows,
+        challenge["active_focus"],
+        show_finish,
+        show_skip_photo,
+        show_ease,
+        show_giveup=not show_finish,
     )
 
 

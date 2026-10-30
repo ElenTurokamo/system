@@ -114,6 +114,10 @@ async def on_photo_received(message: Message, bot):
     Фото запрашивается СРАЗУ, как только закрыты все физические цели дня -
     не дожидаясь интеллектуальных и не дожидаясь нажатия "Завершить испытание".
     Для чисто интеллектуальных испытаний это сообщение просто ни на что не среагирует.
+
+    В группу фото при этом НЕ отправляется: оно только сохраняется (file_id в БД) и уходит
+    вместе с отчётом лишь после завершения испытания - вручную или автоматически
+    (см. bot/completion.py). Сдача/провал фото в группу не отправляют вовсе.
     """
     challenge = await db.get_active_challenge(message.from_user.id)
     if not challenge or challenge["physical_photo_done"]:
@@ -124,33 +128,10 @@ async def on_photo_received(message: Message, bot):
     if not physical_rows or not all(r["completed"] for r in physical_rows):
         return  # фото сейчас не ожидается
 
-    user = await db.get_user(message.from_user.id)
-    posted = False
-    if user["group_id"]:
-        # Секретная строка в отчёте оценивается ТОЛЬКО по физическим дисциплинам
-        # (см. Database.physical_bonus_achieved) - специально не завязана на
-        # общий challenges.bonus_claimed (который требует x2 ещё и по
-        # интеллектуальным дисциплинам): иначе пришлось бы тянуть с отчётом до
-        # закрытия шахмат/чтения, а по мышцам прогресс тренировки оценить уже
-        # не получится, памп пройдёт. Полный бонус (x2 XP) от этого никак не
-        # зависит и по-прежнему даётся только при закрытии ВСЕГО испытания.
-        eased = bool(challenge.get("eased"))
-        physical_bonus = (not eased) and await db.physical_bonus_achieved(challenge["id"])
-        # Серия в БД увеличится только при завершении испытания, а отчёт - про текущий
-        # день, поэтому +1: первый день - "день 1" (так же считает авто-отчёт, см. completion.py).
-        caption = tx.photo_caption(
-            user["streak"] + 1,
-            message.from_user.id,
-            physical_bonus_claimed=physical_bonus,
-            eased=eased,
-        )
-        try:
-            await bot.send_photo(user["group_id"], message.photo[-1].file_id, caption=caption)
-            posted = True
-        except Exception:
-            posted = False  # тихо - итоговый статус виден в самом сообщении испытания
-
-    await db.mark_physical_photo(challenge["id"], posted=posted)
+    # Условный UPDATE: если два фото пришли разом (альбом) или фото опоздало за
+    # "Пропустить фото"/завершением - сохранится только первое, остальные игнорируются.
+    if not await db.store_physical_photo(challenge["id"], message.photo[-1].file_id):
+        return
 
     try:
         await message.delete()
@@ -168,7 +149,7 @@ async def on_skip_physical_photo(call: CallbackQuery):
         await call.answer()
         return
 
-    await db.mark_physical_photo(challenge_id, posted=False)
+    await db.skip_physical_photo(challenge_id)
     await challenge_render.push_challenge_update(call.bot, challenge_id)
     await call.answer()
 
@@ -194,15 +175,27 @@ async def on_finish_challenge(call: CallbackQuery):
     await call.answer()
 
 
-async def _execute_give_up(bot: Bot, challenge: dict):
-    """Собственно сдача испытания - вызывается только после подтверждения "Да"."""
+GIVEUP_LOCKED_TEXT = "Все цели дня выполнены - сдаться уже нельзя. Заверши испытание."
+
+
+async def _execute_give_up(bot: Bot, challenge: dict) -> bool:
+    """
+    Собственно сдача испытания - вызывается только после подтверждения "Да".
+    Возвращает False, если сдавать нечего: испытание уже закрыто или все цели дня закрыты.
+    """
     challenge_id = challenge["id"]
     user_id = challenge["user_id"]
 
     # Условный UPDATE: если испытание уже закрыто (двойное нажатие "Да" или
     # планировщик успел просрочить его раньше) - второй штраф/провал не засчитываем.
+    # Он же не даёт сдать испытание, у которого закрыты все цели (кнопки "Сдаться" в
+    # этом случае нет - см. Database.give_up_challenge).
     if not await db.give_up_challenge(challenge_id):
-        return
+        return False
+
+    user = await db.get_user(user_id)
+    streak_lost = (user or {}).get("streak") or 0
+
     await db.record_daily_stats(challenge_id)
     await db.reset_streak(user_id)
     # "Сдался" - это тоже пропущенный день: та же XP-плата и то же ограничение,
@@ -220,7 +213,10 @@ async def _execute_give_up(bot: Bot, challenge: dict):
             "gave_up", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
         ),
     )
+    # Сообщение о поражении в группу - до профиля: профиль при сбоях edit ждёт повторов.
+    await failure_policy.post_failure_report(bot, user_id, streak_lost=streak_lost)
     await profile.sync_profile_message(bot, user_id)
+    return True
 
 
 async def _ease_unavailable_reason(call: CallbackQuery, challenge: dict | None) -> str | None:
@@ -304,6 +300,9 @@ async def on_give_up_request(call: CallbackQuery):
     подменяет карточку испытания на экран подтверждения "Сдаться?" с кнопками
     "Да"/"Нет" (см. challenge_render.push_giveup_confirm). Собственно сдача
     происходит только после явного "Да" - см. on_give_up_confirmed.
+
+    Если все цели дня уже закрыты, кнопки "Сдаться" на карточке нет; устаревший клик по ней
+    (клиент ещё показывал старую клавиатуру) отклоняется, а карточка перерисовывается.
     """
     challenge_id = int(call.data.split(":")[1])
     challenge = await db.get_challenge(challenge_id)
@@ -312,6 +311,10 @@ async def on_give_up_request(call: CallbackQuery):
         return
     if challenge["status"] != "awaiting_action":
         await call.answer("Испытание уже закрыто.", show_alert=True)
+        return
+    if await db.goals_ready(challenge_id):
+        await call.answer(GIVEUP_LOCKED_TEXT, show_alert=True)
+        await challenge_render.push_challenge_update(call.bot, challenge_id)
         return
 
     await challenge_render.push_giveup_confirm(call.bot, challenge_id)
@@ -330,7 +333,16 @@ async def on_give_up_confirmed(call: CallbackQuery):
         await call.answer("Испытание уже закрыто.", show_alert=True)
         return
 
-    await _execute_give_up(call.bot, challenge)
+    if not await _execute_give_up(call.bot, challenge):
+        # Пока висел экран подтверждения, игрок закрыл последнюю цель (или испытание закрылось
+        # само) - сдача не прошла. Возвращаем карточку в актуальный вид, если она ещё жива.
+        fresh = await db.get_challenge(challenge_id)
+        if fresh and fresh["status"] == "awaiting_action":
+            await call.answer(GIVEUP_LOCKED_TEXT, show_alert=True)
+            await challenge_render.push_challenge_update(call.bot, challenge_id)
+        else:
+            await call.answer("Испытание уже закрыто.", show_alert=True)
+        return
     await call.answer()
 
 

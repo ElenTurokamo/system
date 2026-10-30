@@ -43,7 +43,7 @@ async def _expire_one(bot: Bot, challenge: dict):
 
     # Время вышло, но все цели дня закрыты - игрок просто забыл нажать "Завершить
     # испытание". Это не провал: испытание засчитывается как выполненное (XP, серия,
-    # статистика, отчёт в группу без фото - см. bot/completion.py). Проверка и смена
+    # статистика, отчёт в группу - см. bot/completion.py). Проверка и смена
     # статуса атомарны: если игрок успел нажать кнопку/сдаться - вернётся False.
     if await completion.complete_challenge_flow(bot, challenge, auto=True):
         return
@@ -52,6 +52,10 @@ async def _expire_one(bot: Bot, challenge: dict):
     # разбирали список, - ничего не штрафуем (см. Database.expire_challenge).
     if not await db.expire_challenge(challenge["id"]):
         return
+
+    # Серия до сброса - для сообщения о поражении в группе.
+    user = await db.get_user(user_id)
+    streak_lost = (user or {}).get("streak") or 0
 
     await db.record_daily_stats(challenge["id"])
     await db.reset_streak(user_id)
@@ -76,6 +80,9 @@ async def _expire_one(bot: Bot, challenge: dict):
             "timeout", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
         ),
     )
+
+    # Сообщение о поражении в группу - до профиля: профиль при сбоях edit ждёт повторов.
+    await failure_policy.post_failure_report(bot, user_id, streak_lost=streak_lost)
 
     await profile.sync_profile_message(bot, user_id)
 
