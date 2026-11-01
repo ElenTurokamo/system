@@ -3,10 +3,13 @@
 """
 import asyncio
 import logging
-from typing import Awaitable, Callable, TypeVar
+import time
+from typing import Awaitable, Callable, Optional, TypeVar
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+
+from bot.state_store import state
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,34 @@ _delete_tasks: dict[tuple[int, int], asyncio.Task] = {}
 _command_messages: dict[tuple[int, str], int] = {}
 
 
+# Фоновые задачи записи в хранилище состояния (снятие автоудаления из синхронных функций).
+# Ссылки держим, чтобы сборщик мусора не убил задачу до завершения.
+_bg_tasks: set[asyncio.Task] = set()
+
+# Сообщения старше этого возраста Telegram удалить уже не даёт (48 ч): записи очереди
+# автоудаления старше не восстанавливаем - просто выбрасываем.
+_PENDING_DELETE_MAX_AGE_SECONDS = 48 * 3600
+
+
+def _spawn_bg(coro) -> None:
+    """Запускает корутину фоном (без ожидания). Вне работающего цикла - тихо закрывает её."""
+    try:
+        task = asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+        return
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+def _command_key_of(chat_id: int, message_id: int) -> Optional[str]:
+    """Ключ команды, под которым это сообщение числится в _command_messages (если числится)."""
+    for (cid, command_key), mid in _command_messages.items():
+        if cid == chat_id and mid == message_id:
+            return command_key
+    return None
+
+
 def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = AUTO_DELETE_SECONDS) -> None:
     """
     Планирует автоудаление сообщения через `delay` секунд после того, как оно
@@ -42,9 +73,11 @@ def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = AUTO_D
     сообщением (например, открытие брифа друга) сбрасывает таймер удаления,
     а не соревнуется со старой задачей.
 
-    Задача живёт только в памяти процесса: если бот перезапустится раньше, чем
-    истекут AUTO_DELETE_SECONDS, конкретное сообщение останется в чате - это не критично,
-    это чисто уборка чата, а не часть игровой логики.
+    Задача живёт в памяти процесса, но срок удаления дублируется в хранилище состояния
+    (bot/state_store.py, таблица pending_deletes): если бот перезапустится раньше, чем
+    истекут `delay` секунд, resume_pending_deletes при старте доудалит сообщение (или
+    удалит сразу, если срок уже прошёл), а не оставит его в чате навсегда. Запись снимается
+    после попытки удаления; остановка процесса (отмена задачи) запись СОХРАНЯЕТ.
     """
     key = (chat_id, message_id)
 
@@ -52,17 +85,27 @@ def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = AUTO_D
     if existing and not existing.done():
         existing.cancel()
 
+    delete_at = time.time() + delay
+
     async def _delayed_delete():
+        attempted = False
         try:
+            await state.put_pending_delete(chat_id, message_id, delete_at, _command_key_of(chat_id, message_id))
             await asyncio.sleep(delay)
+            attempted = True
             await bot.delete_message(chat_id, message_id)
         except asyncio.CancelledError:
-            pass  # таймер сброшен новым взаимодействием - это ожидаемо
+            # Таймер сброшен новым взаимодействием (новая задача перезапишет срок), отмена
+            # через cancel_scheduled_delete (она сама снимает запись) либо остановка процесса
+            # (запись нужна, чтобы доудалить после перезапуска) - во всех случаях не трогаем.
+            attempted = False
         except Exception as e:
             logger.info(
                 "Не удалось автоудалить сообщение %s в чате %s: %s", message_id, chat_id, e
             )
         finally:
+            if attempted:
+                await state.drop_pending_delete(chat_id, message_id)
             if _delete_tasks.get(key) is asyncio.current_task():
                 _delete_tasks.pop(key, None)
 
@@ -70,10 +113,41 @@ def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = AUTO_D
 
 
 def cancel_scheduled_delete(chat_id: int, message_id: int) -> None:
-    """Отменяет запланированное автоудаление совсем (без повторного запуска)."""
+    """Отменяет запланированное автоудаление совсем (без повторного запуска), в т.ч. в хранилище."""
     existing = _delete_tasks.pop((chat_id, message_id), None)
     if existing and not existing.done():
         existing.cancel()
+    if state.connected:
+        _spawn_bg(state.drop_pending_delete(chat_id, message_id))
+
+
+async def resume_pending_deletes(bot: Bot) -> int:
+    """
+    Вызывается при старте бота: возвращает в работу автоудаления, запланированные до
+    перезапуска (таблица pending_deletes). Срок уже прошёл - сообщение удаляется сразу (с
+    небольшой разгрузкой между сообщениями, чтобы не упереться во flood-control), иначе
+    удаляется в свой срок. Заодно восстанавливается правило "одно сообщение на команду"
+    (_command_messages). Записи старше 48 ч выбрасываются: Telegram такие не удаляет.
+    Возвращает число восстановленных записей.
+    """
+    rows = await state.list_pending_deletes()
+    now = time.time()
+    resumed = 0
+    for row in rows:
+        chat_id, message_id, delete_at = row["chat_id"], row["message_id"], row["delete_at"]
+        if now - delete_at > _PENDING_DELETE_MAX_AGE_SECONDS:
+            await state.drop_pending_delete(chat_id, message_id)
+            continue
+        if (chat_id, message_id) in _delete_tasks:
+            continue  # уже запланировано в этом процессе
+        if row.get("command_key"):
+            _command_messages[(chat_id, row["command_key"])] = message_id
+        remaining = max(0.0, delete_at - now) + resumed * 0.05
+        schedule_delete(bot, chat_id, message_id, remaining)
+        resumed += 1
+    if resumed:
+        logger.info("Восстановлено автоудалений после перезапуска: %s", resumed)
+    return resumed
 
 
 async def replace_command_message(bot: Bot, chat_id: int, command_key: str) -> None:

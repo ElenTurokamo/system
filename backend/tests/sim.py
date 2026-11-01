@@ -290,6 +290,7 @@ def fresh_modules():
     for task in list(utils._delete_tasks.values()):
         task.cancel()
     utils._delete_tasks.clear()
+    utils._bg_tasks.clear()
     import bot.scheduler as sched
     sched._stale_profile_retry_at.clear()
     import bot.challenge_render as cr
@@ -318,16 +319,24 @@ async def run_scenario(fn, **setting_overrides):
 
     asyncio.sleep = fast_sleep
 
+    from bot.state_store import state
+
     db = database.db
-    db.path = os.path.join(tempfile.mkdtemp(), "t.sql")
+    tmp = tempfile.mkdtemp()
+    db.path = os.path.join(tmp, "t.sql")
     Clock.now = datetime(2026, 10, 22, 7, 59, 0)
+    # Хранилище состояния - отдельный файл, как в проде (отдельный том); подключается до
+    # основной БД, чтобы connect() сверил ключи. Так все сценарии заодно проверяют зеркалирование.
+    await state.connect(os.path.join(tmp, "state", "bot_state.db"))
     await db.connect()
     sim = Sim(db, FakeBot(), settings)
+    sim.state = state
     try:
         return await fn(sim)
     finally:
         asyncio.sleep = real_sleep
         await db.close()
+        await state.close()
         for k, v in saved.items():
             setattr(settings, k, v)
 

@@ -339,11 +339,14 @@ def test_delivered_challenge_still_expires_with_penalty():
     """Регрессия: обычная просрочка ДОСТАВЛЕННОГО квеста работает как раньше."""
     async def sc(s):
         await s.make_user(1)
+        # Второй провал подряд (первый простился заморозкой) - штраф как раньше.
+        await s.db._conn.execute("UPDATE users SET consecutive_failures = 1 WHERE user_id = 1")
+        await s.db._conn.commit()
         await s.until(t(8, 5))
         await s.until(t(2, 5, day=23))     # 08:00 + 18ч = 02:00
         assert (await s.challenges(1))[0]["status"] == "expired"
         u = await s.db.get_user(1)
-        assert u["consecutive_failures"] == 1 and u["penalty_until"]
+        assert u["consecutive_failures"] == 2 and u["penalty_until"]
     sim.run(sc)
 
 

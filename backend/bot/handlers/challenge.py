@@ -4,13 +4,11 @@ from aiogram.types import CallbackQuery, Message
 from bot import challenge_render
 from bot import completion
 from bot import failure_policy
-from bot import messages as tx
 from bot import profile
 from bot.config import (
     BONUS_MULTIPLIER,
     BONUS_XP_MULTIPLIER,
     FOCUS_OPTIONS,
-    settings,
     xp_reward_for_challenge,
 )
 from bot.database import db
@@ -193,29 +191,9 @@ async def _execute_give_up(bot: Bot, challenge: dict) -> bool:
     if not await db.give_up_challenge(challenge_id):
         return False
 
-    user = await db.get_user(user_id)
-    streak_lost = (user or {}).get("streak") or 0
-
-    await db.record_daily_stats(challenge_id)
-    await db.reset_streak(user_id)
-    # "Сдался" - это тоже пропущенный день: та же XP-плата и то же ограничение,
-    # что и при обычной просрочке (см. scheduler.expire_stale_challenges).
-    await db.add_xp(user_id, -settings.missed_day_xp_penalty)
-    await db.set_penalty(user_id, settings.penalty_hours)
-
-    # Второй провал подряд - Система останавливается сама (см. failure_policy).
-    await failure_policy.register_failure(user_id)
-
-    await challenge_render.close_failed_challenge(
-        bot,
-        challenge_id,
-        tx.challenge_failed(
-            "gave_up", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
-        ),
-    )
-    # Сообщение о поражении в группу - до профиля: профиль при сбоях edit ждёт повторов.
-    await failure_policy.post_failure_report(bot, user_id, streak_lost=streak_lost)
-    await profile.sync_profile_message(bot, user_id)
+    # "Сдался" - это такой же провал, как просрочка: первый подряд прощается (серия
+    # замораживается), второй - полная кара (см. failure_policy.apply_failure).
+    await failure_policy.apply_failure(bot, challenge_id, user_id, "gave_up")
     return True
 
 

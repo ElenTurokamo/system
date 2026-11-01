@@ -15,6 +15,17 @@ class Settings:
     bot_token: str = field(default_factory=lambda: os.environ["BOT_TOKEN"])
     tz: str = field(default_factory=lambda: _env("TZ", "Asia/Almaty"))
     db_path: str = field(default_factory=lambda: _env("DB_PATH", "./data/db.sql"))
+    # Дополнительная локальная БД (см. bot/state_store.py): ключи важных сообщений бота
+    # (профиль, отчёт о провале), кэш file_id гайда и очередь автоудаления. Это ОТДЕЛЬНЫЙ
+    # файл, который не входит в автобэкап и не перезаписывается при откате db.sql из бэкапа.
+    # По умолчанию лежит рядом с основной БД; в Docker вынесен на отдельный том (см.
+    # docker-compose.yml: STATE_DB_PATH=/app/state/bot_state.db).
+    state_db_path: str = field(
+        default_factory=lambda: os.getenv("STATE_DB_PATH")
+        or os.path.join(
+            os.path.dirname(os.path.abspath(_env("DB_PATH", "./data/db.sql"))), "bot_state.db"
+        )
+    )
 
     time_morning: str = field(default_factory=lambda: _env("TIME_MORNING", "05:00"))
     time_day: str = field(default_factory=lambda: _env("TIME_DAY", "13:00"))
@@ -155,6 +166,28 @@ class Settings:
 
 
 settings = Settings()
+
+# ---------- Заморозка серии (первый провал подряд прощается) ----------
+
+# Сколько проваленных испытаний ПОДРЯД прощается без штрафа: серия замораживается (🧊 в
+# профиле), XP не снимается, ограничений нет. Провал сверх этого числа - полная кара:
+# -XP, обнуление серии, ограничение доступа (см. bot/failure_policy.py).
+FREEZE_GRACE_FAILURES = 1
+
+
+def failure_is_forgiven(consecutive_failures: int) -> bool:
+    """
+    Прощается ли провал, который делает счётчик проваленных подряд равным
+    `consecutive_failures` (то есть ВКЛЮЧАЯ этот провал: первый подряд -> 1).
+
+    Прощается, пока счётчик в пределах FREEZE_GRACE_FAILURES И ещё не достиг порога
+    автоостановки Системы: при AUTO_STOP_AFTER_FAILURES=1 любой провал и так останавливает
+    Систему, а значит прощения нет - иначе игрок остановился бы без всякого штрафа.
+    """
+    return (
+        1 <= consecutive_failures <= FREEZE_GRACE_FAILURES
+        and consecutive_failures < settings.auto_stop_after_failures
+    )
 
 # ---------- Таймер и предупреждения о провале испытания ----------
 

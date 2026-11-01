@@ -35,6 +35,7 @@ from bot.config import (
     FOCUS_OPTIONS,
     ease_available,
     eased_target,
+    failure_is_forgiven,
     level_from_total_xp,
     settings,
 )
@@ -532,10 +533,16 @@ async def maybe_send_failure_warning(bot: Bot, challenge: dict) -> bool:
     user_id = challenge["user_id"]
     await clear_warning_message(bot, challenge["id"])  # предыдущее предупреждение (60 -> 30 -> 15)
 
+    # Если провал, который грозит сейчас, был бы ПЕРВЫМ подряд - он простится (серия
+    # замораживается, штрафа нет): предупреждение не должно пугать карой, которой не будет
+    # (и, наоборот, обязано честно описать полную кару, когда прощения уже нет).
+    user = await db.get_user(user_id)
+    frozen = failure_is_forgiven(int((user or {}).get("consecutive_failures") or 0) + 1)
     text = tx.challenge_warning(
         threshold,
         xp_loss=settings.missed_day_xp_penalty,
         penalty_hours=settings.penalty_hours,
+        frozen=frozen,
     )
     try:
         # Обычное уведомление (со звуком) - это именно та ситуация, ради которой

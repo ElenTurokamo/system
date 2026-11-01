@@ -35,11 +35,13 @@ It's a minimal, self-hostable accountability system built to feel like a levelin
 | 📈 **XP, levels & streaks** | 100 XP per challenge, 1000 XP per level, persistent daily streak counter |
 | 🎯 **Per-focus daily targets** | Every chosen focus has a goal (e.g. 50 push-ups); the day only counts as done once all goals are hit |
 | 🕵️ **Undocumented x2 bonus** | Push a single discipline to double its target and secretly earn +5 levels instantly — then it locks for the day |
-| 🏳️ **Give-up penalties** | Bailing on a quest resets your streak and starts a 48h penalty timer |
+| 🧊 **Streak freeze** | The first failed quest in a row is forgiven: the streak is frozen (🧊 instead of 🔥), no XP loss, no restrictions |
+| 🏳️ **Give-up penalties** | Failing two quests in a row (timeout or Give Up) resets your streak, takes XP and starts a 48h penalty timer |
 | ⌛ **Auto-expiry** | Unfinished quests silently expire after a configurable timeout |
 | 🗣️ **Non-repetitive System voice** | Messages are composed from a fragment bank, not hardcoded — thousands of unique combinations out of the box |
 | 📌 **Self-cleaning onboarding** | Each registration step deletes the previous one — no chat clutter |
 | 📍 **Live pinned profile card** | A single pinned message with your stats, auto-updated on every challenge completion or expiry |
+| 💾 **State store** | A second, independent SQLite file keeps message keys (profile, failure report), the guide `file_id` and the auto-delete queue — survives a restart and a `db.sql` rollback |
 | 🐳 **One-command deploy** | Docker Compose, SQLite, no external services required |
 
 ## 🛠️ Tech stack
@@ -67,6 +69,8 @@ docker compose up -d --build
 
 Your SQLite database will live at `./data_storage/db.sql` on the host — it survives rebuilds. This is mounted to a dedicated `/app/storage` path inside the container, separate from the bundled `/app/data` (message fragment bank), so the mount never shadows files baked into the image.
 
+The second database — the **state store** (`bot_state.db`) — lives on its own volume, `./data_state` on the host (`/app/state` in the container), and is deliberately **not** part of the git backup (see "State store" below).
+
 ## 📁 Project structure
 
 ```
@@ -75,6 +79,8 @@ solo_bot/
 │   ├── main.py            # entrypoint
 │   ├── config.py          # settings, focus options, time-of-day labels
 │   ├── database.py        # aiosqlite layer + schema
+│   ├── state_store.py     # independent state DB: message keys, guide file_id, auto-delete queue
+│   ├── failure_policy.py  # failure handling: streak freeze (1st) / full penalty (2nd in a row) / auto-stop
 │   ├── keyboards.py        # inline keyboards
 │   ├── messages.py         # System-voice message generator
 │   ├── dispatch.py         # fault-tolerant daily delivery: retries, catch-up, skip rules
@@ -133,14 +139,14 @@ A cron job runs for each of the 4 time slots (`TIME_MORNING` / `TIME_DAY` / `TIM
 - Sending a number is treated as **one set** — it's added to that focus's running total, and the user's message is deleted immediately to keep the chat clean.
 - A focus gets a **✅** the moment its target is reached — but it stays selectable, so the player can keep stacking sets on it (e.g. chasing the secret bonus below) while other focuses are still open.
 - The **day's challenge only completes once every focus has hit its target** (or the player gives up) — reaching one goal doesn't end the challenge by itself.
-- **🏳 Give Up** resets the streak, applies the 48h penalty, and closes the message (keyboard removed). The button is shown only while at least one goal is still open: once every focus is closed it disappears and only **🏁 Finish** is left (it comes back if the player rolls progress back below a target). A stale click on it is rejected, and the SQL guard in `Database.give_up_challenge` makes a completed-goals quest impossible to give up even in a race.
+- **🏳 Give Up** counts as a failed quest (see **Streak freeze** below: forgiven the first time in a row, full penalty the second time) and closes the message (keyboard removed). The button is shown only while at least one goal is still open: once every focus is closed it disappears and only **🏁 Finish** is left (it comes back if the player rolls progress back below a target). A stale click on it is rejected, and the SQL guard in `Database.give_up_challenge` makes a completed-goals quest impossible to give up even in a race.
 - **Group reports are sent only when a challenge ends.** A photo sent after the physical goals are closed is only *stored* (`challenges.physical_photo_file_id`, the message is deleted from the chat) — nothing reaches the group at that moment. The report goes out from `bot/completion.py` when the challenge is completed, manually (**🏁 Finish**) or automatically (timeout): with a stored photo it is the photo plus the report caption (`Отчёт дня N. Игрок … завершил испытание.`, plus the secret-quest / eased lines evaluated at completion time); without a photo it is the same text — but only on the automatic path (a manual finish after skipping the photo posts nothing, as before). If the photo cannot be sent, the same report goes out as text. A failed or given-up quest never posts the photo.
-- **Defeat message to the group.** When a quest fails (timeout or Give Up) an additional message is posted to the bound group — the player was defeated, the penalty (−XP, access restriction hours) and the streak reset (with the number of lost days if the streak was non-zero), `messages.group_failure_report`, sent from `failure_policy.post_failure_report`. It is sent once per failure (the same conditional `UPDATE` that guards the penalty guards it), is independent of the personal failure card, and a failing group never blocks the penalty.
-- A separate job runs every minute and expires (edits + closes) any quest older than `CHALLENGE_TIMEOUT_HOURS` (default: 18h) that was never finished, resetting the streak and applying the penalty.
+- **Defeat message to the group.** When a quest fails (timeout or Give Up) an additional message is posted to the bound group — the player was defeated, the penalty (−XP, access restriction hours) and the streak reset (with the number of lost days if the streak was non-zero), `messages.group_failure_report`, sent from `failure_policy.post_failure_report`. It is sent once per failure (the same conditional `UPDATE` that guards the penalty guards it), is independent of the personal failure card, and a failing group never blocks the penalty. If the failure is forgiven (first in a row), the group message says so instead (`messages.group_failure_frozen_report`): the player was defeated, the streak is frozen, **no** penalty — and warns that the next failure in a row costs the streak.
+- A separate job runs every minute and expires (edits + closes) any quest older than `CHALLENGE_TIMEOUT_HOURS` (default: 18h) that was never finished, counting it as a failure (freeze or penalty, see below).
 - **Forgot to press "Finish"?** When the timeout hits, the quest is *not* failed if every discipline is already closed: it is completed automatically (XP, streak, daily stats, reset of the failure counter - exactly like the button), and the report (`Отчёт дня N. Игрок … завершил испытание.`, plus the secret-quest line if earned) is posted to the bound group: with the stored photo if the player sent one, otherwise as text. Never twice. The profile shows the quest (and the secret quest) as done. Day numbering in the report starts from 1 (the streak including the day being completed). While every goal is closed, no "time is running out / penalty" warnings are sent, and one that is already hanging is deleted the moment the last goal is closed (they come back if the player rolls progress back below the target). Check and status change are one atomic SQL `UPDATE` (`Database.complete_challenge_if_ready`), so the button, the timeout and Give Up can never both apply. Code: `bot/completion.py`.
 - **Failure warnings:** the player gets a push 60, 30 and 15 minutes before the quest fails (the previous warning is deleted when the next one arrives, and all of them are removed when the quest closes). In the last 15 minutes the card timer switches to `MM:SS` and refreshes every `CHALLENGE_COUNTDOWN_REFRESH_SECONDS` (default 1).
-- **Penalty pause:** after a failure (timeout or Give Up) no new quests are issued until the penalty timer shown in the profile runs out; skipped slots are simply not dispatched.
-- **Auto-stop:** if the player fails two daily quests in a row (timeout or Give Up, no completed quest in between), the System suspends itself (same state as `/stop`) and stays off until `/start`. A completed quest resets the counter; `/start` after an auto-stop starts from a clean slate. Threshold: `AUTO_STOP_AFTER_FAILURES` (default `2`).
+- **Penalty pause:** after a FULL failure (the second in a row; a forgiven first one imposes no pause) no new quests are issued until the penalty timer shown in the profile runs out; skipped slots are simply not dispatched.
+- **Auto-stop:** if the player fails two daily quests in a row (timeout or Give Up, no completed quest in between), the System suspends itself (same state as `/stop`) and stays off until `/start`. A completed quest resets the counter; `/start` after an auto-stop starts from a clean slate. Threshold: `AUTO_STOP_AFTER_FAILURES` (default `2`). The second failure in a row therefore carries the full penalty *and* stops the System.
 - **Delivery fault tolerance:** a quest only counts as issued once its card actually reaches the player (`bot/dispatch.py`, journal in the `dispatch_log` table). If sending fails, the bot retries every `DISPATCH_RETRY_INTERVAL_MINUTES` (60) up to `DISPATCH_RETRY_ATTEMPTS` (3) times — slot, +1h, +2h, +3h — and then skips the player until the next day; the undelivered card is removed and never penalizes the player (the timeout is counted from the moment of real delivery). No retries are made if the player switched the System off: `/stop` or auto-stop (also between attempts), a blocked bot (marked unreachable immediately), or a changed quest time. A check runs every minute; if the slot's cron did not fire at all (bot was down or restarted), quests are sent late within `DISPATCH_CATCHUP_WINDOW_MINUTES` (180) of the slot, only to players registered before the slot.
 
 **Secret x2 bonus:** this isn't advertised anywhere in the UI. If a player pushes a single focus to `target × 2` (e.g. 100 push-ups when the goal was 50), the bot fires a one-off "hidden protocol detected" message and instantly grants `+5 levels`. That focus is then **sealed** (`✅🔒`) for the rest of the day — it can't be selected again, so the bonus can't be farmed twice on the same discipline.
@@ -159,6 +165,50 @@ Around 50 push-ups a day, finishing the daily quest gets really hard, and a skip
 - **Effects of "Да":** every discipline's target is halved (rounded up, minimum 1: 50→25, 55→28, 25→13, 3→2); progress already logged is kept and can close a discipline at once; the reward for the quest is **half the XP** (`eased_reward`, rounded down); the **secret quest is off** for the day - no 🔥 marks, no bonus, even at double the old norm; the **streak continues** as usual; the profile and the group report get the note "📉 Сложность в этот день была понижена" (if the photo report had already gone out before easing, a short separate note is sent at completion).
 - **Hidden when:** every goal of the day is closed, difficulty is already lowered, or the quest is closed. If progress is rolled back below the target, the button comes back.
 - **Atomic:** `Database.ease_challenge` is a conditional `UPDATE` (status, not eased, an open goal exists), so a double "Да" or "Да" together with finish/expiry can't halve the targets twice. Code: `handlers/challenge.py` (`on_ease_*`), `challenge_render.py` (`push_ease_confirm`, `ease_offered`), `completion.py` (reward, notes).
+
+</details>
+
+<details>
+<summary><strong>Streak freeze (🧊)</strong></summary>
+
+<br>
+
+A failed quest (timeout or **Give Up**) is judged by how many quests the player has failed **in a row** (`users.consecutive_failures`, reset by every completed quest):
+
+| Failure | What happens |
+|---|---|
+| **1st in a row** | **Forgiven.** The streak is kept and *frozen*: the profile (and the friend brief) show 🧊 instead of 🔥 next to the streak. **No** XP loss, **no** access restriction, the next quest arrives at the usual time. The player gets a failure card without penalties, the bound group gets a failure message (without penalties) saying the streak is frozen. |
+| **2nd in a row** | **Full penalty** (the old rules): −`MISSED_DAY_XP_PENALTY` XP, streak reset to 0, access restriction for `PENALTY_HOURS` (no new quests meanwhile), and the System auto-stops (`AUTO_STOP_AFTER_FAILURES`, default 2). The freeze is cleared. |
+
+Completing a quest while frozen unfreezes the streak (🔥 again) and it keeps growing: the frozen day is simply "skipped", it neither counts nor breaks the streak. A quest completed between two failures restores the grace (the next failure is the "1st in a row" again). The 60/30/15-minute warnings tell the truth too: while a failure would be forgiven they announce a freeze instead of a penalty.
+
+Details worth knowing:
+- Both failure paths (timeout in `scheduler._expire_one`, **Give Up** in `handlers/challenge._execute_give_up`) go through the single `failure_policy.apply_failure`; it runs only after the conditional `UPDATE` that closes the quest, so a double click or a click racing the timeout cannot apply it twice.
+- With `AUTO_STOP_AFTER_FAILURES=1` there is no grace (`config.failure_is_forgiven`): every failure is a full one, otherwise the System would stop without any penalty. The number of forgiven failures is `config.FREEZE_GRACE_FAILURES` (1).
+- Players upgraded from the old version keep their counter but have no freeze flag (their earlier failure was already penalized), so their next failure is treated as the 2nd in a row.
+- A manual `/stop` + `/start` keeps the freeze and the counter (no loophole); `/start` after an *auto*-stop starts from a clean slate.
+- The player guide (`data/guide.pdf`, slide "Не успел? Вот что будет") is a pre-rendered PDF and still describes the old rule — regenerate it from `frontend/Гайд по системе.pptx` when convenient.
+
+</details>
+
+<details>
+<summary><strong>State store (second local database)</strong></summary>
+
+<br>
+
+`bot/state_store.py` is a small independent SQLite file (`STATE_DB_PATH`, default `/app/state/bot_state.db` on its own Docker volume `./data_state`). It is opened **before** the main DB and is **not** included in the git backup.
+
+**Why.** The main DB already stores the profile message id, but `db.sql` can be rolled back (restore from the twice-a-week backup, recreated volume, replaced file). Then it holds *stale* ids: the pinned profile can no longer be edited, the bot sends a new one and the old copy stays in the chat as a duplicate (and cannot be deleted once it is older than 48 h). The state store keeps a write-through copy of the keys that is not rolled back.
+
+| Table | Contents | Used by |
+|---|---|---|
+| `message_keys` | `(kind, user_id) → chat_id, message_id, created_at, updated_at` for the **profile** and the **failure report** message; an empty `message_id` is a tombstone ("cleared") | `Database.set_/clear_profile_message`, `set_/clear_failure_message` (write-through), `Database.reconcile_message_keys` (startup) |
+| `kv` | the Telegram `file_id` of the PDF guide, with a fingerprint (bot id + sha256 of `guide.pdf`) | `bot/guide.py` — no re-upload after a restart; replacing the PDF or the token invalidates it |
+| `pending_deletes` | auto-delete queue of ephemeral messages (command replies, `/help` with the guide, friend list…) | `bot/utils.py` — `resume_pending_deletes` runs at startup, so such messages no longer stay in the chat forever after a restart |
+
+**Reconciliation at startup** (`Database.reconcile_message_keys`, runs in `db.connect()`): for every player and key the *fresher* record wins (main DB: send time of the message; state store: `updated_at`); an empty store is seeded from the main DB; a tombstone newer than a stale key clears it; a live key missing in the main DB comes back from the store. After the rollback scenario the profile is edited in place — no duplicate.
+
+**Principles.** The store is auxiliary: any failure (disk, permissions, locked file) is only logged and never breaks the bot; while it is not connected every method is a no-op. Process shutdown keeps `pending_deletes` rows (only a finished delete attempt or an explicit cancel removes them). Intentionally **not** persisted: the "Сдаться? / Снизить сложность?" confirmation screens and flood-control timestamps (monotonic clocks, the next timer tick redraws the card), per-player locks, and the dispatcher's "slot in progress" set (the DB journal `dispatch_runs` already covers restarts).
 
 </details>
 
@@ -228,6 +278,8 @@ All configuration lives in `.env` (see `.env.example`):
 | `DISPATCH_RETRY_INTERVAL_MINUTES` | Step between delivery attempts | `60` |
 | `DISPATCH_CATCHUP_WINDOW_MINUTES` | How long after a slot a missed (cron did not fire) delivery is still sent | `180` |
 | `DB_PATH` | Path to the SQLite file | `/app/storage/db.sql` |
+| `STATE_DB_PATH` | Path to the state-store SQLite file (message keys, guide `file_id`, auto-delete queue) | `/app/state/bot_state.db` (default without Docker: `bot_state.db` next to `DB_PATH`) |
+| `MISSED_DAY_XP_PENALTY` | XP taken on a full failure (the 2nd in a row) | `300` |
 
 Per-focus daily targets, active-focus marker emojis, and the secret bonus multiplier/reward live in `bot/config.py` (`FOCUS_OPTIONS`, `BONUS_MULTIPLIER`, `BONUS_LEVELS`) rather than `.env`, since they're gameplay tuning rather than deployment config.
 

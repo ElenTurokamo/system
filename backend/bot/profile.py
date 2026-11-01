@@ -121,6 +121,15 @@ def player_code(user: dict) -> str:
     return f"{date_part}-{user['user_id']}"
 
 
+def streak_emoji(user: dict) -> str:
+    """
+    Эмодзи серии: 🔥 - обычная, 🧊 (кубик льда) - серия заморожена первым провалом подряд
+    (users.streak_frozen, см. bot/failure_policy.py). Один источник для личного профиля и
+    брифа друга (bot/friends.py).
+    """
+    return tx.FREEZE_EMOJI if user.get("streak_frozen") else "🔥"
+
+
 def display_name(user: dict) -> str:
     return user.get("first_name") or user.get("username") or f"Игрок {user['user_id']}"
 
@@ -168,7 +177,7 @@ def render_profile_text(
         "『Профиль Игрока』\n\n"
         f"🆔 {html.escape(display_name(user))} · #<code>{player_code(user)}</code>\n"
         f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
-        f"🔥 Серия: {streak} {ru_days(streak)}\n\n"
+        f"{streak_emoji(user)} Серия: {streak} {ru_days(streak)}\n\n"
         f"⏰ Время испытаний: {time_label}\n"
         f"👥 Группа привязана: {group_line}"
     )

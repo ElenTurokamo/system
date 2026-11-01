@@ -3,12 +3,16 @@
 Все операции асинхронные (aiosqlite), чтобы не блокировать event loop бота.
 """
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import aiosqlite
 
 from bot.config import EASE_TARGET_DIVISOR, FOCUS_OPTIONS, settings
+from bot.state_store import state
+
+logger = logging.getLogger(__name__)
 
 # Статусы испытания, считающиеся провалом (штрафные).
 FAILED_STATUSES = ("expired", "gave_up")
@@ -27,6 +31,7 @@ CREATE TABLE IF NOT EXISTS users (
     streak          INTEGER DEFAULT 0,
     penalty_until   TEXT,
     consecutive_failures INTEGER DEFAULT 0, -- проваленных испытаний подряд (см. bot/failure_policy.py)
+    streak_frozen   INTEGER DEFAULT 0,  -- серия заморожена первым провалом подряд (🧊 в профиле, см. failure_policy)
     daily_pushups   INTEGER DEFAULT 0,
     daily_squats    INTEGER DEFAULT 0,
     daily_abs       INTEGER DEFAULT 0,
@@ -173,6 +178,9 @@ class Database:
         await self._conn.commit()
         await self._migrate()
         await self.prune_dispatch_log(settings.dispatch_log_retention_days)
+        # Сверка ключей сообщений с отдельным хранилищем (bot/state_store.py): после отката
+        # db.sql из бэкапа возвращает актуальные id профиля. Без подключённого хранилища - no-op.
+        await self.reconcile_message_keys()
 
     async def _migrate(self):
         """Добавляет новые колонки в уже существующие БД, не трогая данные."""
@@ -194,6 +202,7 @@ class Database:
             "daily_running": "INTEGER DEFAULT 0",
             "is_stopped": "INTEGER DEFAULT 0",  # /stop - Система приостановлена, дневные квесты не выдаются
             "consecutive_failures": "INTEGER DEFAULT 0",  # проваленных испытаний подряд (автостоп)
+            "streak_frozen": "INTEGER DEFAULT 0",  # серия заморожена первым провалом подряд (см. failure_policy)
             "guide_sent": "INTEGER DEFAULT 0",  # PDF-гайд уже отправлен при регистрации (см. bot/guide.py)
         }
         changed = False
@@ -337,6 +346,109 @@ class Database:
         )
         await self._conn.commit()
 
+    # ---------- сверка ключей сообщений с отдельным хранилищем (bot/state_store.py) ----------
+
+    # kind -> (колонка чата, колонка id сообщения, колонка времени отправки) в таблице users.
+    _MIRRORED_KEYS = {
+        "profile": ("profile_chat_id", "profile_message_id", "profile_created_at"),
+        "failure": ("failure_chat_id", "failure_message_id", "failure_sent_at"),
+    }
+
+    @staticmethod
+    def _parse_ts(raw: Optional[str]) -> Optional[datetime]:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return None
+
+    async def reconcile_message_keys(self) -> dict:
+        """
+        Сверяет ключи сообщений основной БД с независимым хранилищем и приводит их к
+        самому свежему состоянию. Вызывается при подключении (connect), то есть при каждом
+        старте бота.
+
+        Для каждого игрока и вида ключа (профиль, отчёт о провале):
+          * в хранилище записи нет - она создаётся из основной БД (первый запуск после
+            обновления; потерянное хранилище);
+          * записи совпадают - ничего не меняется (если у основной БД пуста отметка времени
+            отправки, а у хранилища известна - она дописывается: по ней считается возраст
+            профиля и срок его пересоздания);
+          * записи различаются - побеждает более свежая: у основной БД это время отправки
+            сообщения (profile_created_at / failure_sent_at), у хранилища - updated_at.
+            Типичный случай: db.sql откатили из бэкапа, в нём старый id профиля, а в
+            хранилище - актуальный. Надгробие хранилища (ключ очищен) тоже "свежее" более
+            старого ключа и очищает его в основной БД;
+          * в основной БД ключа нет вовсе, а в хранилище живой ключ - он возвращается
+            (устаревший id безвреден: правка/удаление такого сообщения просто не пройдёт, а
+            бот сам пришлёт и закрепит новый профиль).
+        Возвращает {"restored": N, "seeded": M} (для лога и тестов).
+        """
+        result = {"restored": 0, "seeded": 0}
+        if not state.connected:
+            return result
+
+        saved = {(r["kind"], r["user_id"]): r for r in await state.list_message_keys()}
+        cur = await self._conn.execute("SELECT * FROM users")
+        users = [dict(r) for r in await cur.fetchall()]
+
+        for user in users:
+            uid = user["user_id"]
+            for kind, (chat_col, msg_col, ts_col) in self._MIRRORED_KEYS.items():
+                main_chat, main_msg, main_ts = user.get(chat_col), user.get(msg_col), user.get(ts_col)
+                rec = saved.get((kind, uid))
+
+                if rec is None:
+                    if main_msg is not None:
+                        await state.put_message_key(
+                            kind, uid, main_chat or uid, main_msg, created_at=main_ts
+                        )
+                        result["seeded"] += 1
+                    continue
+
+                rec_msg, rec_chat = rec["message_id"], rec["chat_id"]
+                same = rec_msg == main_msg and (rec_msg is None or (rec_chat or uid) == (main_chat or uid))
+                if same:
+                    if main_msg is not None and not main_ts and rec["created_at"]:
+                        await self._conn.execute(
+                            f"UPDATE users SET {ts_col} = ? WHERE user_id = ?", (rec["created_at"], uid)
+                        )
+                        result["restored"] += 1
+                    continue
+
+                rec_dt = self._parse_ts(rec["updated_at"])
+                main_dt = self._parse_ts(main_ts)
+                if main_msg is None:
+                    state_wins = rec_msg is not None
+                else:
+                    state_wins = main_dt is None or (rec_dt is not None and rec_dt > main_dt)
+
+                if state_wins:
+                    if rec_msg is None:
+                        await self._conn.execute(
+                            f"UPDATE users SET {msg_col} = NULL, {ts_col} = NULL WHERE user_id = ?", (uid,)
+                        )
+                    else:
+                        await self._conn.execute(
+                            f"UPDATE users SET {chat_col} = ?, {msg_col} = ?, {ts_col} = ? WHERE user_id = ?",
+                            (rec_chat or uid, rec_msg, rec["created_at"], uid),
+                        )
+                    result["restored"] += 1
+                    logger.info(
+                        "Ключ сообщения %s игрока %s восстановлен из хранилища состояния (id %s)",
+                        kind, uid, rec_msg,
+                    )
+                elif main_msg is not None:
+                    # Основная БД свежее (хранилище было недоступно/отстало) - подтягиваем его.
+                    await state.put_message_key(kind, uid, main_chat or uid, main_msg, created_at=main_ts)
+                    result["seeded"] += 1
+
+        await self._conn.commit()
+        if result["restored"] or result["seeded"]:
+            logger.info("Сверка ключей сообщений: %s", result)
+        return result
+
     async def get_users_with_stale_profile(self, max_age_hours: float) -> list[dict]:
         """
         Игроки, у которых сообщению профиля уже не меньше max_age_hours (или возраст
@@ -372,12 +484,16 @@ class Database:
         await self._conn.commit()
 
     async def set_profile_message(self, user_id: int, chat_id: int, message_id: int):
+        created_at = datetime.utcnow().isoformat()
         await self._conn.execute(
             "UPDATE users SET profile_chat_id = ?, profile_message_id = ?, profile_created_at = ? "
             "WHERE user_id = ?",
-            (chat_id, message_id, datetime.utcnow().isoformat(), user_id),
+            (chat_id, message_id, created_at, user_id),
         )
         await self._conn.commit()
+        # Тот же ключ - в независимое хранилище (переживает откат db.sql). Тот же created_at,
+        # чтобы при сверке записи сравнивались по одной отметке времени.
+        await state.put_message_key("profile", user_id, chat_id, message_id, created_at=created_at)
 
     async def clear_profile_message(self, user_id: int):
         """Профиля в чате больше нет (удалён, см. profile.retire_profile_message)."""
@@ -386,14 +502,18 @@ class Database:
             (user_id,),
         )
         await self._conn.commit()
+        # Надгробие: старый ключ из откатившейся основной БД не должен воскреснуть при сверке.
+        await state.put_message_key("profile", user_id, None, None)
 
     async def set_failure_message(self, user_id: int, chat_id: int, message_id: int):
+        sent_at = datetime.utcnow().isoformat()
         await self._conn.execute(
             "UPDATE users SET failure_chat_id = ?, failure_message_id = ?, failure_sent_at = ? "
             "WHERE user_id = ?",
-            (chat_id, message_id, datetime.utcnow().isoformat(), user_id),
+            (chat_id, message_id, sent_at, user_id),
         )
         await self._conn.commit()
+        await state.put_message_key("failure", user_id, chat_id, message_id, created_at=sent_at)
 
     async def clear_failure_message(self, user_id: int):
         await self._conn.execute(
@@ -402,6 +522,7 @@ class Database:
             (user_id,),
         )
         await self._conn.commit()
+        await state.put_message_key("failure", user_id, None, None)
 
     async def get_users_with_expired_failure_message(self, ttl_minutes: int) -> list[dict]:
         """
@@ -484,9 +605,24 @@ class Database:
         return int((user or {}).get("consecutive_failures") or 0)
 
     async def reset_failures(self, user_id: int):
-        """Обнуляет счётчик провалов подряд (испытание выполнено / Система возобновлена после автостопа)."""
+        """
+        Обнуляет счётчик провалов подряд (испытание выполнено / Система возобновлена после
+        автостопа). Серия провалов закончилась - значит, и заморозка серии (🧊) снимается.
+        """
         await self._conn.execute(
-            "UPDATE users SET consecutive_failures = 0 WHERE user_id = ?", (user_id,)
+            "UPDATE users SET consecutive_failures = 0, streak_frozen = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        await self._conn.commit()
+
+    async def set_streak_frozen(self, user_id: int, frozen: bool):
+        """
+        Заморозка серии: первый провал подряд не штрафуется, серия сохраняется, а в профиле
+        вместо 🔥 показывается 🧊 (см. profile.streak_emoji). Снимается выполненным испытанием
+        (reset_failures) или вторым провалом подряд (reset_streak).
+        """
+        await self._conn.execute(
+            "UPDATE users SET streak_frozen = ? WHERE user_id = ?", (1 if frozen else 0, user_id)
         )
         await self._conn.commit()
 
@@ -519,7 +655,10 @@ class Database:
         return user["streak"]
 
     async def reset_streak(self, user_id: int):
-        await self._conn.execute("UPDATE users SET streak = 0 WHERE user_id = ?", (user_id,))
+        # Обнулённую серию замораживать нечего - флаг 🧊 снимается вместе с ней.
+        await self._conn.execute(
+            "UPDATE users SET streak = 0, streak_frozen = 0 WHERE user_id = ?", (user_id,)
+        )
         await self._conn.commit()
 
     async def add_focus_amount(self, user_id: int, focus_key: str, amount: int):

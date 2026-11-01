@@ -11,7 +11,7 @@ from aiogram.types import InlineKeyboardMarkup
 from bot import keyboards as kb
 from bot.config import FOCUS_OPTIONS, level_from_total_xp
 from bot.database import db
-from bot.profile import display_name, focus_stat_line, ru_days
+from bot.profile import display_name, focus_stat_line, ru_days, streak_emoji
 
 # Друзей на одну страницу /friendlist. Стрелочки листания появляются, только
 # когда друзей больше, чем помещается на одну страницу - то есть больше 3.
@@ -118,7 +118,7 @@ async def render_brief(friend: dict, viewer_id: int, page: int) -> tuple[str, In
     text = (
         f"『 {html.escape(display_name(friend))} 』\n\n"
         f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
-        f"🔥 Серия: {streak} {ru_days(streak)}\n"
+        f"{streak_emoji(friend)} Серия: {streak} {ru_days(streak)}\n"
         f"📋 Испытание сегодня: {await status_label(friend['user_id'])}\n\n"
         f"{stats}"
     )

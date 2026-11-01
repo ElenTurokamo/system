@@ -10,12 +10,19 @@ from bot.database import db
 from bot.handlers import challenge, friends, group, misc, start, stats
 from bot.middlewares import DeleteCommandsMiddleware
 from bot.scheduler import setup_scheduler
+from bot.state_store import state
+from bot.utils import resume_pending_deletes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 
 async def main():
+    # Хранилище состояния подключается ДО основной БД: при её подключении ключи сообщений
+    # сверяются с ним (Database.reconcile_message_keys) - после отката db.sql из бэкапа
+    # профиль игрока снова можно редактировать. Бот работает и без него (только логирует).
+    if await state.connect():
+        logger.info("Хранилище состояния подключено: %s", settings.state_db_path)
     await db.connect()
     logger.info("База данных подключена: %s", settings.db_path)
 
@@ -30,6 +37,9 @@ async def main():
     dp.include_router(friends.router)
     dp.include_router(misc.router)
 
+    # Автоудаления, запланированные до перезапуска (ответы на команды, /help с гайдом и т.п.).
+    await resume_pending_deletes(bot)
+
     scheduler = setup_scheduler(bot)
     scheduler.start()
     logger.info("Планировщик запущен (TZ=%s)", settings.tz)
@@ -40,6 +50,7 @@ async def main():
     finally:
         scheduler.shutdown(wait=False)
         await db.close()
+        await state.close()
         await bot.session.close()
 
 

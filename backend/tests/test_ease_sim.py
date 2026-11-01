@@ -453,7 +453,8 @@ def test_manual_finish_without_a_group_report_sends_nothing_extra():
 def test_failing_an_eased_quest_has_the_normal_penalty():
     async def sc(s):
         ch = await setup_ease_quest(s, focuses=("pushups", "reading"))
-        await s.db._conn.execute("UPDATE users SET streak = 6 WHERE user_id = 1")
+        # Второй провал подряд (первый простился заморозкой) - полная кара даже при сниженной сложности.
+        await s.db._conn.execute("UPDATE users SET streak = 6, consecutive_failures = 1 WHERE user_id = 1")
         await s.db._conn.commit()
         xp0 = (await s.db.get_user(1))["xp"]
         await ease_yes(s, ch)

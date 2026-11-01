@@ -5,6 +5,7 @@
 
 # --- Database ---
 data_storage/
+data_state/
 *.sqlite3
 *.db
 db.sql

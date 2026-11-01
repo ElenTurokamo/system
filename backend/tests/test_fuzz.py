@@ -147,6 +147,24 @@ async def _check_invariants(s, uid_slots):
         cur = await q("SELECT COUNT(*) n FROM challenges WHERE user_id=? AND COALESCE(physical_photo_posted,0)=1", (uid,))
         assert len(s.bot.sent("send_photo", gid)) == (await cur.fetchone())["n"], f"I17: фото игрока {uid} задублировано/потеряно"
 
+    # I18: заморозка серии. Заморожена только после первого провала подряд (счётчик = 1); при двух и
+    # более подряд проваленных серия обнулена, заморозки нет, ограничение наложено; без провалов
+    # подряд заморозки нет.
+    for uid in uid_slots:
+        u = await db.get_user(uid)
+        frozen, cf = u["streak_frozen"] or 0, u["consecutive_failures"] or 0
+        assert not (frozen and cf != 1), f"I18: у игрока {uid} заморозка при счётчике провалов {cf}"
+        if cf >= 2:
+            assert u["streak"] == 0 and u["penalty_until"], f"I18: игрок {uid}: {cf} провала(ов) подряд без кары"
+
+    # I19: независимое хранилище состояния зеркалирует ключи сообщений основной БД
+    # (профиль и отчёт о провале) в любой момент - write-through не отстаёт ни при каких сбоях.
+    for uid in uid_slots:
+        u = await db.get_user(uid)
+        for kind, col in (("profile", "profile_message_id"), ("failure", "failure_message_id")):
+            rec = await s.state.get_message_key(kind, uid)
+            assert (rec["message_id"] if rec else None) == u[col], f"I19: {kind}-ключ игрока {uid} разошёлся с хранилищем"
+
     if not (s.cron_down):
         stuck = (Clock.now - timedelta(minutes=3)).isoformat()
         cur = await q("SELECT * FROM dispatch_log WHERE status='pending' AND next_attempt_at < ?", (stuck,))
@@ -278,6 +296,9 @@ async def _scenario(s, seed, days=3):
 
         await s.step(1)
         await _check_invariants(s, uid_slots)
+
+    # --- итог: после "перезапуска" сверка с хранилищем ничего не меняет (они согласованы) ---
+    assert await s.db.reconcile_message_keys() == {"restored": 0, "seeded": 0}, "I19: расхождение после прогона"
 
     # --- итог: интервал между доставленными карточками одного игрока ---
     by_user = {}

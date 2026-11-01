@@ -12,7 +12,6 @@ from bot import challenge_render
 from bot import completion
 from bot import dispatch
 from bot import failure_policy
-from bot import messages as tx
 from bot import profile
 from bot.config import settings
 from bot.database import db
@@ -53,38 +52,11 @@ async def _expire_one(bot: Bot, challenge: dict):
     if not await db.expire_challenge(challenge["id"]):
         return
 
-    # Серия до сброса - для сообщения о поражении в группе.
-    user = await db.get_user(user_id)
-    streak_lost = (user or {}).get("streak") or 0
-
-    await db.record_daily_stats(challenge["id"])
-    await db.reset_streak(user_id)
-
-    # Пропущенный день - штраф: -300 XP (с понижением уровня, если сгорает
-    # весь запас XP текущего уровня) и ограничение на PENALTY_HOURS часов,
-    # которое отображается в профиле (см. bot/profile.py::penalty_block)
-    # и само обновляется там каждую минуту (см. refresh_penalty_profiles).
-    # Пока ограничение действует, новые испытания не выдаются (см.
-    # dispatch._process_locked).
-    await db.add_xp(user_id, -settings.missed_day_xp_penalty)
-    await db.set_penalty(user_id, settings.penalty_hours)
-
-    # Второй провал подряд - Система останавливается сама (см. failure_policy).
-    # Должно быть до sync_profile_message ниже, чтобы профиль уже показал паузу.
-    await failure_policy.register_failure(user_id)
-
-    await challenge_render.close_failed_challenge(
-        bot,
-        challenge["id"],
-        tx.challenge_failed(
-            "timeout", xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
-        ),
-    )
-
-    # Сообщение о поражении в группу - до профиля: профиль при сбоях edit ждёт повторов.
-    await failure_policy.post_failure_report(bot, user_id, streak_lost=streak_lost)
-
-    await profile.sync_profile_message(bot, user_id)
+    # Первый провал подряд прощается (серия замораживается, штрафа нет), второй подряд -
+    # полная кара: -XP, обнуление серии, ограничение доступа и автостоп Системы. Решение,
+    # карточка игроку, сообщение в группу и обновление профиля - в failure_policy.apply_failure
+    # (общий путь с "Сдаться").
+    await failure_policy.apply_failure(bot, challenge["id"], user_id, "timeout")
 
 
 async def refresh_challenge_timers(bot: Bot):

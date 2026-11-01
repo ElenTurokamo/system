@@ -189,6 +189,44 @@ def challenge_failed(reason: str, xp_loss: int = 0, penalty_hours: int = 0) -> s
     )
 
 
+# Эмодзи замороженной серии - то же, что в профиле вместо 🔥 (см. profile.streak_emoji).
+FREEZE_EMOJI = "🧊"
+
+
+def challenge_failed_frozen(
+    reason: str, streak: int = 0, xp_loss: int = 0, penalty_hours: int = 0
+) -> str:
+    """
+    Карточка-уведомление о ПЕРВОМ провале подряд: испытание провалено, но штраф не наложен -
+    серия заморожена (в профиле 🧊 вместо 🔥). Оформлена так же, как challenge_failed, и так
+    же ФИКСИРОВАНА. Заодно предупреждает, чем обернётся следующий провал подряд (xp_loss и
+    penalty_hours - то, что будет наложено тогда).
+
+    streak - сохранённая серия; при нулевой серии строка про неё не выводится (замораживать
+    нечего), но провал всё равно прощается.
+    """
+    reason_line = _FAILURE_REASON_LINES.get(reason, "Дневной квест провален.")
+    lines = [
+        "⚠ 『 Уведомление Системы 』 ⚠",
+        SYSTEM_DIVIDER,
+        "Статус квеста: ПРОВАЛЕН",
+        reason_line,
+        SYSTEM_DIVIDER,
+        f"Сработала защита серии {FREEZE_EMOJI}",
+    ]
+    if streak > 0:
+        lines.append(f"▸ Серия из {_days_genitive(streak)}: заморожена")
+    lines += [
+        "▸ Штраф и ограничения: не наложены",
+        SYSTEM_DIVIDER,
+        "Это первый провал подряд — он прощён.",
+        f"Провал следующего испытания обнулит серию, снимет {xp_loss} XP "
+        f"и ограничит доступ на {penalty_hours} ч.",
+        "Выполни следующий квест — и серия продолжится.",
+    ]
+    return "\n".join(lines)
+
+
 def _days_genitive(n: int) -> str:
     """«N дня/дней» в родительном падеже - для оборота «серия из N дней»."""
     n_abs = abs(n)
@@ -224,6 +262,31 @@ def group_failure_report(user_id: int, xp_loss: int = 0, penalty_hours: int = 0,
     )
 
 
+def group_failure_frozen_report(user_id: int, streak_saved: int = 0) -> str:
+    """
+    Сообщение в привязанную группу о ПЕРВОМ провале подряд: игрок потерпел поражение, но штраф
+    не наложен - серия заморожена (см. failure_policy.post_failure_report). Текст фиксирован.
+
+    streak_saved - сохранённая серия; при нулевой строка про неё не выводится.
+    """
+    lines = [
+        "⚠ 『 Уведомление Системы 』 ⚠",
+        SYSTEM_DIVIDER,
+        f"Игрок {user_id} потерпел поражение.",
+        "Дневной квест провален.",
+        SYSTEM_DIVIDER,
+        f"Сработала защита серии {FREEZE_EMOJI}",
+    ]
+    if streak_saved > 0:
+        lines.append(f"▸ Серия из {_days_genitive(streak_saved)}: заморожена")
+    lines += [
+        "▸ Штраф и ограничения: не наложены",
+        SYSTEM_DIVIDER,
+        "Провал следующего испытания подряд обнулит серию и повлечёт штраф.",
+    ]
+    return "\n".join(lines)
+
+
 def _warning_time_phrase(minutes: int) -> str:
     if minutes == 60:
         return "менее часа"
@@ -232,7 +295,9 @@ def _warning_time_phrase(minutes: int) -> str:
     return f"менее {minutes} минут"
 
 
-def challenge_warning(minutes: int, xp_loss: int = 0, penalty_hours: int = 0) -> str:
+def challenge_warning(
+    minutes: int, xp_loss: int = 0, penalty_hours: int = 0, frozen: bool = False
+) -> str:
     """
     Предупреждение о скором провале дневного квеста: приходит отдельным
     сообщением (с обычным звуком) за 60, 30 и 15 минут до дедлайна - см.
@@ -243,8 +308,24 @@ def challenge_warning(minutes: int, xp_loss: int = 0, penalty_hours: int = 0) ->
     minutes - порог, который только что пересёк таймер; формулировка "менее N"
     (а не "ровно N") честна и в том случае, если бот был недоступен и
     предупреждение ушло с небольшим опозданием.
+
+    frozen=True - провал, который грозит сейчас, был бы ПЕРВЫМ подряд и простился бы
+    (серия замораживается, штрафа нет): вместо списка кары - честное описание этого.
     """
     phrase = _warning_time_phrase(minutes)
+    if frozen:
+        return (
+            "⚠ 『 Предупреждение Системы 』 ⚠\n"
+            f"{SYSTEM_DIVIDER}\n"
+            f"До провала дневного квеста осталось {phrase}.\n"
+            "Закрой все цели и заверши испытание вовремя.\n"
+            f"{SYSTEM_DIVIDER}\n"
+            "Это был бы первый провал подряд — штраф не будет наложен:\n"
+            f"▸ Серия дней: будет заморожена {FREEZE_EMOJI}\n"
+            "▸ Опыт и доступ: без изменений\n"
+            f"{SYSTEM_DIVIDER}\n"
+            "Время идёт."
+        )
     return (
         "⚠ 『 Предупреждение Системы 』 ⚠\n"
         f"{SYSTEM_DIVIDER}\n"

@@ -210,13 +210,15 @@ def test_next_day_quest_arrives_normally_after_auto_finish():
 def test_unfinished_goals_still_fail_exactly_as_before():
     async def sc(s):
         ch = await setup_quest(s, focuses=("pushups", "chess"))
-        await s.db._conn.execute("UPDATE users SET xp = 500, streak = 3 WHERE user_id = 1")
+        # Второй провал подряд (первый уже был и простился) - полная кара, как раньше.
+        await s.db._conn.execute(
+            "UPDATE users SET xp = 500, streak = 3, consecutive_failures = 1 WHERE user_id = 1")
         await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 10)       # шахматы не сыграны
         await s.until(DEADLINE)
         assert await status_of(s, ch["id"]) == "expired"
         u = await s.db.get_user(1)
-        assert (u["xp"], u["streak"], u["consecutive_failures"]) == (200, 0, 1)
+        assert (u["xp"], u["streak"], u["consecutive_failures"]) == (200, 0, 2)
         assert u["penalty_until"] is not None
         assert len(failure_pushes(s, 1)) == 1
         # В группу уходит ровно одно сообщение о поражении (серия 3 дня была сброшена).

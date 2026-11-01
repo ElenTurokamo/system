@@ -184,11 +184,13 @@ def test_confirm_screen_open_then_last_goal_closed_then_yes_is_rejected():
 def test_giveup_still_works_normally_with_open_goals_and_gives_failure_flow():
     async def sc(s):
         ch = await setup_quest(s)
+        await s.db._conn.execute("UPDATE users SET consecutive_failures = 1 WHERE user_id = 1")  # второй провал подряд
+        await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 3)
         await give_up_flow(s, ch)
         assert await status_of(s, ch["id"]) == "gave_up"
         u = await user(s)
-        assert u["consecutive_failures"] == 1 and u["penalty_until"]
+        assert u["consecutive_failures"] == 2 and u["penalty_until"]
         assert (1, ch["message_id"]) not in s.bot.alive              # карточка удалена
     sim.run(sc)
 
@@ -619,7 +621,7 @@ def test_failure_message_text_format():
 def test_timeout_failure_sends_group_message_once_with_lost_streak():
     async def sc(s):
         ch = await setup_quest(s)
-        await s.db._conn.execute("UPDATE users SET xp = 500, streak = 6 WHERE user_id = 1")
+        await s.db._conn.execute("UPDATE users SET xp = 500, streak = 6, consecutive_failures = 1 WHERE user_id = 1")
         await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 4)
         await s.until(DEADLINE)
@@ -635,7 +637,7 @@ def test_timeout_failure_sends_group_message_once_with_lost_streak():
 def test_give_up_failure_sends_group_message_with_lost_streak_and_card_to_player():
     async def sc(s):
         ch = await setup_quest(s)
-        await s.db._conn.execute("UPDATE users SET xp = 500, streak = 1 WHERE user_id = 1")
+        await s.db._conn.execute("UPDATE users SET xp = 500, streak = 1, consecutive_failures = 1 WHERE user_id = 1")
         await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 4)
         await give_up_flow(s, ch)
@@ -649,6 +651,8 @@ def test_give_up_failure_sends_group_message_with_lost_streak_and_card_to_player
 def test_failure_on_zero_streak_says_streak_reset_without_number():
     async def sc(s):
         ch = await setup_quest(s)
+        await s.db._conn.execute("UPDATE users SET consecutive_failures = 1 WHERE user_id = 1")  # второй провал подряд
+        await s.db._conn.commit()
         await give_up_flow(s, ch)
         assert group_texts(s) == [_expected_failure(1, 0)]
         assert "▸ Серия дней: сброшена" in group_texts(s)[0]
@@ -658,11 +662,13 @@ def test_failure_on_zero_streak_says_streak_reset_without_number():
 def test_failure_without_group_sends_nothing_and_does_not_break_penalty():
     async def sc(s):
         ch = await setup_quest(s, group=None)
+        await s.db._conn.execute("UPDATE users SET consecutive_failures = 1 WHERE user_id = 1")  # второй провал подряд
+        await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 4)
         await s.until(DEADLINE)
         assert await status_of(s, ch["id"]) == "expired"
         u = await user(s)
-        assert u["consecutive_failures"] == 1 and u["penalty_until"]
+        assert u["consecutive_failures"] == 2 and u["penalty_until"]
         assert [m for m in s.bot.log if m[1] == GROUP] == []
     sim.run(sc)
 
@@ -681,25 +687,27 @@ def test_failure_in_one_group_does_not_leak_into_another():
 def test_group_down_during_failure_still_applies_penalty_card_and_profile():
     async def sc(s):
         ch = await setup_quest(s)
-        await s.db._conn.execute("UPDATE users SET xp = 500, streak = 3 WHERE user_id = 1")
+        await s.db._conn.execute("UPDATE users SET xp = 500, streak = 3, consecutive_failures = 1 WHERE user_id = 1")
         await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 4)
         fail_method(s.bot, "send_message", GROUP, net_error)
         await s.until(DEADLINE)
         u = await user(s)
         assert await status_of(s, ch["id"]) == "expired"
-        assert (u["xp"], u["streak"], u["consecutive_failures"]) == (200, 0, 1) and u["penalty_until"]
+        assert (u["xp"], u["streak"], u["consecutive_failures"]) == (200, 0, 2) and u["penalty_until"]
         assert any("ПРОВАЛЕН" in kw["text"] for kw in s.bot.sent("send_message", 1))
         assert group_texts(s) == []
     sim.run(sc)
 
     async def sc2(s):
         ch = await setup_quest(s)
+        await s.db._conn.execute("UPDATE users SET consecutive_failures = 1 WHERE user_id = 1")  # второй провал подряд
+        await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 4)
         s.bot.blocked.add(GROUP)                                     # бот выгнан из группы
         await give_up_flow(s, ch)
         assert await status_of(s, ch["id"]) == "gave_up"
-        assert (await user(s))["consecutive_failures"] == 1
+        assert (await user(s))["consecutive_failures"] == 2
     sim.run(sc2)
 
 
@@ -766,16 +774,21 @@ def test_two_failures_in_a_row_send_two_messages_and_auto_stop_still_works():
         await s.db._conn.execute("UPDATE users SET xp = 5000, streak = 4 WHERE user_id = 1")
         await s.db._conn.commit()
         await log(s, 1, ch["id"], "pushups", 3)
-        await give_up_flow(s, ch)                                    # провал 1 (серия 4)
-        await s.until(t(8, 5, day=25))                               # штраф 48 ч прошёл, новый квест
+        await give_up_flow(s, ch)                                    # провал 1: прощён, серия 4 заморожена
+        u = await user(s)
+        assert (u["xp"], u["streak"], u["streak_frozen"], u["penalty_until"]) == (5000, 4, 1, None)
+        assert not u["is_stopped"]
+        await s.until(t(8, 5, day=23))                               # штрафа нет - квест приходит в обычное время
         ch2 = await s.db.get_active_challenge(1)
         assert ch2 and ch2["id"] != ch["id"]
-        await give_up_flow(s, ch2)                                   # провал 2 -> автостоп
+        await give_up_flow(s, ch2)                                   # провал 2: полная кара + автостоп
         u = await user(s)
         assert u["is_stopped"] and u["consecutive_failures"] == 2
+        assert (u["streak"], u["streak_frozen"], u["xp"]) == (0, 0, 4700) and u["penalty_until"]
         reports = failure_reports(s)
         assert len(reports) == 2
-        assert "Серия из 4 дней: сброшена" in reports[0] and "▸ Серия дней: сброшена" in reports[1]
+        assert "Серия из 4 дней: заморожена" in reports[0] and "Штраф и ограничения: не наложены" in reports[0]
+        assert "Серия из 4 дней: сброшена" in reports[1] and "Ограничение доступа" in reports[1]
     sim.run(sc)
 
 
