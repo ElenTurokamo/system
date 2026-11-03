@@ -69,7 +69,7 @@ docker compose up -d --build
 
 Your SQLite database will live at `./data_storage/db.sql` on the host — it survives rebuilds. This is mounted to a dedicated `/app/storage` path inside the container, separate from the bundled `/app/data` (message fragment bank), so the mount never shadows files baked into the image.
 
-The second database — the **state store** (`bot_state.db`) — lives on its own volume, `./data_state` on the host (`/app/state` in the container), and is deliberately **not** part of the git backup (see "State store" below).
+The second database — the **state store** (`bot_state.db`) — lives on its own volume, `./data_state` on the host (`/app/state` in the container), and is backed up to git as a separate file `bot_state.db` next to `db.sql` (see "State store" below).
 
 ## 📁 Project structure
 
@@ -196,7 +196,7 @@ Details worth knowing:
 
 <br>
 
-`bot/state_store.py` is a small independent SQLite file (`STATE_DB_PATH`, default `/app/state/bot_state.db` on its own Docker volume `./data_state`). It is opened **before** the main DB and is **not** included in the git backup.
+`bot/state_store.py` is a small independent SQLite file (`STATE_DB_PATH`, default `/app/state/bot_state.db` on its own Docker volume `./data_state`). It is opened **before** the main DB. The git auto-backup uploads it as a separate file (`bot_state.db`) next to `db.sql`; both files are copied via SQLite's online-backup API so a snapshot is never taken mid-write. Restoring `db.sql` from a backup does not overwrite the live state file.
 
 **Why.** The main DB already stores the profile message id, but `db.sql` can be rolled back (restore from the twice-a-week backup, recreated volume, replaced file). Then it holds *stale* ids: the pinned profile can no longer be edited, the bot sends a new one and the old copy stays in the chat as a duplicate (and cannot be deleted once it is older than 48 h). The state store keeps a write-through copy of the keys that is not rolled back.
 

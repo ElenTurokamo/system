@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     time_of_day     TEXT,               -- morning / day / evening / night
     focuses         TEXT DEFAULT '[]',  -- JSON-список ключей из FOCUS_OPTIONS
     group_id        INTEGER,
+    group_link      TEXT,               -- ссылка на привязанную группу для профиля (см. profile.resolve_group_link)
     xp              INTEGER DEFAULT 0,
     level           INTEGER DEFAULT 1,
     streak          INTEGER DEFAULT 0,
@@ -204,6 +205,7 @@ class Database:
             "consecutive_failures": "INTEGER DEFAULT 0",  # проваленных испытаний подряд (автостоп)
             "streak_frozen": "INTEGER DEFAULT 0",  # серия заморожена первым провалом подряд (см. failure_policy)
             "guide_sent": "INTEGER DEFAULT 0",  # PDF-гайд уже отправлен при регистрации (см. bot/guide.py)
+            "group_link": "TEXT",  # ссылка на привязанную группу для строки «Группа» в профиле
         }
         changed = False
         backfill_failures = "consecutive_failures" not in existing_users
@@ -331,11 +333,37 @@ class Database:
         await self._conn.commit()
         return focuses
 
-    async def set_group(self, user_id: int, group_id: int):
+    async def set_group(self, user_id: int, group_id: int, group_link: Optional[str] = None):
+        """
+        Привязывает группу. Ссылка на группу всегда перезаписывается (в том числе значением
+        None): при привязке ДРУГОЙ группы старая ссылка не должна остаться в профиле.
+        """
         await self._conn.execute(
-            "UPDATE users SET group_id = ? WHERE user_id = ?", (group_id, user_id)
+            "UPDATE users SET group_id = ?, group_link = ? WHERE user_id = ?",
+            (group_id, group_link, user_id),
         )
         await self._conn.commit()
+
+    async def set_group_link(self, user_id: int, group_id: int, group_link: Optional[str]) -> bool:
+        """
+        Сохраняет ссылку на группу, только если игрок всё ещё привязан именно к group_id
+        (пока ссылка запрашивалась у Telegram, группу могли перепривязать - устаревшая
+        ссылка не должна затереть новую). True - ссылка записана.
+        """
+        cur = await self._conn.execute(
+            "UPDATE users SET group_link = ? WHERE user_id = ? AND group_id = ?",
+            (group_link, user_id, group_id),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    async def get_users_without_group_link(self) -> list[dict]:
+        """Игроки с привязанной группой, но без сохранённой ссылки (разовое дозаполнение при старте)."""
+        cur = await self._conn.execute(
+            "SELECT user_id, group_id FROM users "
+            "WHERE group_id IS NOT NULL AND (group_link IS NULL OR group_link = '')"
+        )
+        return [dict(r) for r in await cur.fetchall()]
 
     async def finish_registration(self, user_id: int):
         await self.set_reg_state(user_id, "done")

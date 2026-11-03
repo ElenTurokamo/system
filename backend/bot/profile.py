@@ -39,7 +39,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
 from bot import messages as tx
-from bot.config import FOCUS_OPTIONS, level_from_total_xp, settings, time_of_day_label
+from bot.config import FOCUS_OPTIONS, level_from_total_xp, settings, time_of_day_short
 from bot.database import db
 from bot.utils import RETRY_AFTER_CAP_SECONDS, call_with_retries
 
@@ -68,9 +68,8 @@ def _ru_plural(n: int, one: str, few: str, many: str) -> str:
 def penalty_block(user: dict) -> str:
     """
     Блок-уведомление о провале требования Системы: показывается, пока у игрока
-    активно ограничение (penalty_until в будущем). Всегда встаёт в самый низ
-    профиля - см. render_profile_text - чтобы цепляться взглядом в первую
-    очередь. Обратный отсчёт пересчитывается при каждом вызове, а сам профиль
+    активно ограничение (penalty_until в будущем). Встаёт последним пунктом
+    «хвоста» профиля (под блоком времени испытаний и группы - см. render_profile_text). Обратный отсчёт пересчитывается при каждом вызове, а сам профиль
     перерисовывается раз в минуту планировщиком (см. scheduler.refresh_penalty_profiles).
     """
     penalty_until = user.get("penalty_until")
@@ -87,16 +86,12 @@ def penalty_block(user: dict) -> str:
 
     total_minutes = int(remaining.total_seconds() // 60)
     hours, minutes = divmod(total_minutes, 60)
-    hours_label = _ru_plural(hours, "час", "часа", "часов")
-    minutes_label = _ru_plural(minutes, "минута", "минуты", "минут")
 
+    # Короткий формат: что запрещено и сколько осталось до снятия.
     return (
-        "🚫 Вы не выполнили требование системы. На вас были наложены ограничения. \n"
-        f"В течении следующих {settings.penalty_hours} часов вы не можете:\n\n"
-        "* Смотреть контент 18+\n"
-        "* Играть в любые видеоигры.\n\n"
-        "⏸ Получение новых испытаний также приостановлено.\n"
-        f"⏱️ До снятия ограничений осталось {hours} {hours_label} и {minutes} {minutes_label}."
+        f"🚫 Вы не выполнили требование системы. Ограничения на {settings.penalty_hours} ч: "
+        "без контента 18+ и видеоигр, новые испытания приостановлены.\n"
+        f"⏱ До снятия: {hours} ч {minutes} мин."
     )
 
 
@@ -161,6 +156,76 @@ def focus_stat_line(focus_key: str, user: dict, bold: bool = False) -> str:
     return f"<b>{line}</b>" if bold else line
 
 
+def group_line(user: dict) -> str:
+    """
+    Строка «Группа» профиля:
+      * ссылка сохранена  -> «👥 Группа: <ссылка>» (кликабельное слово «ссылка»);
+      * группа привязана, а ссылки нет (Telegram её не отдал) -> «👥 Группа: привязана»;
+      * группы нет -> подсказка, как её привязать.
+    Ссылка берётся из users.group_link (заполняется при привязке - см. resolve_group_link),
+    поэтому отрисовка остаётся чистой функцией без обращений к Telegram.
+    """
+    if not user.get("group_id"):
+        return "👥 Группа: нет (напиши /bind_group в группе)"
+    link = (user.get("group_link") or "").strip()
+    if link.startswith(("https://", "http://")):
+        return f'👥 Группа: <a href="{html.escape(link, quote=True)}">ссылка</a>'
+    return "👥 Группа: привязана"
+
+
+def settings_block(user: dict) -> str:
+    """Нижний блок профиля: время испытаний (эмодзи + время) и группа."""
+    time_label = time_of_day_short(user["time_of_day"]) if user.get("time_of_day") else "—"
+    return f"⏰ Время испытаний: {time_label}\n{group_line(user)}"
+
+
+async def resolve_group_link(bot: Bot, chat_id: int) -> str | None:
+    """
+    Ссылка на группу для профиля (None - получить не удалось). По убыванию надёжности:
+      1. публичная группа - https://t.me/<username>;
+      2. уже существующая пригласительная ссылка чата (get_chat отдаёт её админам);
+      3. новая пригласительная ссылка (нужно право админа «Приглашать пользователей»);
+         create_chat_invite_link, а не export: export ОТОЗВАЛ бы прежнюю основную ссылку группы;
+      4. приватная супергруппа без доступной ссылки - https://t.me/c/<id>/1: работает для
+         участников (а игрок - участник), посторонним не откроется.
+    Любой сбой только логируется - привязка группы из-за ссылки ломаться не должна.
+    """
+    chat = None
+    try:
+        chat = await bot.get_chat(chat_id)
+    except Exception as e:  # noqa: BLE001
+        logger.info("Ссылка на группу %s: get_chat не удался: %s", chat_id, e)
+
+    if chat is not None:
+        username = getattr(chat, "username", None)
+        if isinstance(username, str) and username:
+            return f"https://t.me/{username}"
+        invite = getattr(chat, "invite_link", None)
+        if isinstance(invite, str) and invite:
+            return invite
+
+    try:
+        created = await bot.create_chat_invite_link(chat_id, name="Solo Leveling")
+        url = getattr(created, "invite_link", None)
+        if isinstance(url, str) and url:
+            return url
+    except Exception as e:  # noqa: BLE001
+        logger.info("Ссылка на группу %s: создать пригласительную ссылку не удалось: %s", chat_id, e)
+
+    raw = str(chat_id)
+    if raw.startswith("-100") and raw[4:].isdigit():
+        return f"https://t.me/c/{raw[4:]}/1"
+    return None
+
+
+async def refresh_group_link(bot: Bot, user_id: int, group_id: int) -> str | None:
+    """Запрашивает ссылку на группу и сохраняет её, если группа игрока за это время не сменилась."""
+    link = await resolve_group_link(bot, group_id)
+    if link:
+        await db.set_group_link(user_id, group_id, link)
+    return link
+
+
 def render_profile_text(
     user: dict,
     quest_done_today: bool = False,
@@ -169,18 +234,18 @@ def render_profile_text(
     eased_today: bool = False,
 ) -> str:
     level, xp_into_level, xp_needed = level_from_total_xp(user["xp"])
-    time_label = time_of_day_label(user["time_of_day"]) if user["time_of_day"] else "—"
-    group_line = "да ✅" if user["group_id"] else "нет (напиши /bind_group в группе)"
     streak = user["streak"]
 
     header = (
         "『Профиль Игрока』\n\n"
         f"🆔 {html.escape(display_name(user))} · #<code>{player_code(user)}</code>\n"
         f"🏆 Уровень: {level} ({xp_into_level}/{xp_needed} XP)\n"
-        f"{streak_emoji(user)} Серия: {streak} {ru_days(streak)}\n\n"
-        f"⏰ Время испытаний: {time_label}\n"
-        f"👥 Группа привязана: {group_line}"
+        f"{streak_emoji(user)} Серия: {streak} {ru_days(streak)}"
     )
+
+    # Блок настроек (время испытаний + группа) - сразу под статистикой; ниже него остановка
+    # Системы и штраф, а самыми нижними идут отметки о выполненном квесте.
+    footer = settings_block(user)
 
     # Дисциплины в профиле показываются в два приоритета (см. описание задачи):
     # Показываем только "нужные" дисциплины: 1) отслеживаемые сейчас (всегда,
@@ -207,21 +272,11 @@ def render_profile_text(
 
     text = f"{header}\n\n{stats}"
 
-    # "Хвост" профиля: отметка о выполнении сегодняшнего квеста (пропадает сама,
-    # как только диспетчер создаст новое испытание на следующий день - см.
-    # sync/resend_profile_message), отметка об остановке Системы (см. /stop) и
-    # блок штрафа за провал требования Системы. Блок штрафа всегда идёт САМЫМ
-    # ПОСЛЕДНИМ, чтобы взгляд цеплялся за него в первую очередь, даже если
-    # квест на сегодня уже выполнен.
+    # Порядок блоков под статистикой: 1) блок настроек (время испытаний и группа),
+    # 2) остановка Системы (/stop) и штраф за провал, 3) отметки о выполнении сегодняшнего
+    # квеста - они всегда САМЫЕ нижние (пропадают сами, как только диспетчер создаст новое
+    # испытание на следующий день - см. sync/resend_profile_message).
     tail: list[str] = []
-    if quest_done_today:
-        tail.append("✅ Вы выполнили сегодняшний квест.")
-        if eased_today:
-            # Сложность понижена: секретного испытания в этот день нет (bonus_claimed всегда 0).
-            tail.append(tx.EASED_NOTE)
-        if bonus_claimed_today:
-            tail.append("✅ Вы завершили секретное испытание.")
-
     if user.get("is_stopped"):
         # Держится, пока игрок не наберёт /start (см. handlers/start.py::cmd_start,
         # там же снимается is_stopped) - до этого момента ежедневные испытания
@@ -232,8 +287,20 @@ def render_profile_text(
     if penalty_text:
         tail.append(penalty_text)
 
+    done: list[str] = []
+    if quest_done_today:
+        done.append("✅ Вы выполнили сегодняшний квест.")
+        if eased_today:
+            # Сложность понижена: секретного испытания в этот день нет (bonus_claimed всегда 0).
+            done.append(tx.EASED_NOTE)
+        if bonus_claimed_today:
+            done.append("✅ Вы завершили секретное испытание.")
+
+    text += f"\n\n{footer}"
     if tail:
         text += "\n\n" + "\n".join(tail)
+    if done:
+        text += "\n\n" + "\n".join(done)
     return text
 
 

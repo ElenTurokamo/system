@@ -17,7 +17,8 @@ class Settings:
     db_path: str = field(default_factory=lambda: _env("DB_PATH", "./data/db.sql"))
     # Дополнительная локальная БД (см. bot/state_store.py): ключи важных сообщений бота
     # (профиль, отчёт о провале), кэш file_id гайда и очередь автоудаления. Это ОТДЕЛЬНЫЙ
-    # файл, который не входит в автобэкап и не перезаписывается при откате db.sql из бэкапа.
+    # файл: бэкапится в git отдельно от db.sql (bot/backup.py), но при откате db.sql из
+    # бэкапа живой файл состояния не перезаписывается.
     # По умолчанию лежит рядом с основной БД; в Docker вынесен на отдельный том (см.
     # docker-compose.yml: STATE_DB_PATH=/app/state/bot_state.db).
     state_db_path: str = field(
@@ -423,3 +424,25 @@ TIME_OF_DAY_LABELS = {
 def time_of_day_label(key: str) -> str:
     """Метка времени суток вместе с точным временем отправки, например '🌅 Утром (05:00)'."""
     return f"{TIME_OF_DAY_LABELS[key]} ({settings.time_slots[key]})"
+
+
+# Только эмодзи слота - для краткой строки профиля (см. time_of_day_short).
+TIME_OF_DAY_EMOJI = {
+    "morning": "🌅",
+    "day": "🌞",
+    "evening": "🌇",
+    "night": "🌙",
+}
+
+
+def time_of_day_short(key: str) -> str:
+    """
+    Краткая метка слота для профиля: эмодзи + время без слов «утром/днём/вечером/ночью»,
+    например '🌇 19:00'. Неизвестный ключ (испорченное значение в БД) не должен ронять
+    отрисовку профиля - для него возвращается прочерк.
+    """
+    emoji = TIME_OF_DAY_EMOJI.get(key)
+    slot_time = settings.time_slots.get(key)
+    if not emoji or not slot_time:
+        return "—"
+    return f"{emoji} {slot_time}"

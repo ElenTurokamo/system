@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import ChatMemberUpdated, Message
@@ -5,6 +7,8 @@ from aiogram.types import ChatMemberUpdated, Message
 from bot import profile
 from bot.database import db
 from bot.registration import finish_registration
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="group")
 
@@ -15,7 +19,13 @@ async def _bind(bot: Bot, user_id: int, group_id: int) -> bool:
     if not user:
         return False
 
+    # Ссылка на группу нужна строке «Группа» профиля. Старая ссылка (прежней группы) при
+    # смене группы сбрасывается внутри set_group, новая подтягивается сразу после привязки.
     await db.set_group(user_id, group_id)
+    try:
+        await profile.refresh_group_link(bot, user_id, group_id)
+    except Exception as e:  # noqa: BLE001 - ссылка не должна ломать привязку группы
+        logger.warning("Не удалось получить ссылку на группу %s (игрок %s): %s", group_id, user_id, e)
 
     if user["reg_state"] != "done":
         await finish_registration(bot, user_id)
