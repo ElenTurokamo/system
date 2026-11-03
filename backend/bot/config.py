@@ -43,10 +43,11 @@ class Settings:
     )
 
     # Сколько проваленных ежедневных испытаний ПОДРЯД приводят к автоматической
-    # остановке Системы (см. bot/failure_policy.py). Выполненное испытание
-    # обнуляет счётчик. Минимум 1.
+    # заморозке (остановке) Системы (см. bot/failure_policy.py). Провал, на котором Система
+    # замораживается, штрафа НЕ влечёт. Выполненное испытание обнуляет счётчик. Минимум 1.
+    # По умолчанию 3: 1-й провал - заморозка серии, 2-й - штраф, 3-й - заморозка Системы.
     auto_stop_after_failures: int = field(
-        default_factory=lambda: max(1, int(_env("AUTO_STOP_AFTER_FAILURES", "2")))
+        default_factory=lambda: max(1, int(_env("AUTO_STOP_AFTER_FAILURES", "3")))
     )
 
     # ---------- Отказоустойчивость ежедневной выдачи (bot/dispatch.py) ----------
@@ -97,11 +98,11 @@ class Settings:
     profile_dispatch_lookahead_hours: int = field(
         default_factory=lambda: int(_env("PROFILE_DISPATCH_LOOKAHEAD_HOURS", "24"))
     )
-    # Через сколько минут после отправки автоматически удаляется пуш-уведомление
-    # о провале испытания (см. scheduler.cleanup_failure_messages), чтобы оно не
-    # копилось в чате даже если игрок не откроет бота до следующего дня.
+    # Через сколько минут после отправки автоматически удаляется уведомление о провале
+    # испытания (см. scheduler.cleanup_failure_messages), чтобы оно не копилось в чате
+    # даже если игрок не откроет бота до следующего дня. По умолчанию - 5 минут.
     failure_message_ttl_minutes: int = field(
-        default_factory=lambda: int(_env("FAILURE_MESSAGE_TTL_MINUTES", "60"))
+        default_factory=lambda: max(1, int(_env("FAILURE_MESSAGE_TTL_MINUTES", "5")))
     )
 
     # Как часто (в секундах) перерисовывается карточка испытания в последние
@@ -168,27 +169,43 @@ class Settings:
 
 settings = Settings()
 
-# ---------- Заморозка серии (первый провал подряд прощается) ----------
+# ---------- Лестница последствий за провалы подряд ----------
+#
+#   1-й провал подряд  - заморозка серии (🧊): XP не снимается, ограничений нет;
+#   2-й и далее        - штраф: -XP, обнуление серии, приостановка новых испытаний на PENALTY_HOURS;
+#   N-й (N = AUTO_STOP_AFTER_FAILURES, по умолчанию 3) - заморозка Системы БЕЗ штрафа: новые
+#                        испытания не приходят, пока игрок не наберёт /start.
+#
+# Подробности - в bot/failure_policy.py.
 
 # Сколько проваленных испытаний ПОДРЯД прощается без штрафа: серия замораживается (🧊 в
-# профиле), XP не снимается, ограничений нет. Провал сверх этого числа - полная кара:
-# -XP, обнуление серии, ограничение доступа (см. bot/failure_policy.py).
+# профиле), XP не снимается, ограничений нет.
 FREEZE_GRACE_FAILURES = 1
+
+
+def failure_stops_system(consecutive_failures: int) -> bool:
+    """
+    Замораживает ли Систему провал, который делает счётчик проваленных подряд равным
+    `consecutive_failures` (ВКЛЮЧАЯ этот провал). Такой провал штрафа не влечёт: Система
+    просто замораживается до /start.
+    """
+    return consecutive_failures >= settings.auto_stop_after_failures
 
 
 def failure_is_forgiven(consecutive_failures: int) -> bool:
     """
-    Прощается ли провал, который делает счётчик проваленных подряд равным
-    `consecutive_failures` (то есть ВКЛЮЧАЯ этот провал: первый подряд -> 1).
+    Прощается ли провал (заморозка серии без штрафа), который делает счётчик проваленных
+    подряд равным `consecutive_failures` (ВКЛЮЧАЯ этот провал: первый подряд -> 1).
 
     Прощается, пока счётчик в пределах FREEZE_GRACE_FAILURES И ещё не достиг порога
-    автоостановки Системы: при AUTO_STOP_AFTER_FAILURES=1 любой провал и так останавливает
-    Систему, а значит прощения нет - иначе игрок остановился бы без всякого штрафа.
+    заморозки Системы: при AUTO_STOP_AFTER_FAILURES=1 первый же провал замораживает Систему,
+    и заморозка серии не нужна.
     """
     return (
         1 <= consecutive_failures <= FREEZE_GRACE_FAILURES
-        and consecutive_failures < settings.auto_stop_after_failures
+        and not failure_stops_system(consecutive_failures)
     )
+
 
 # ---------- Таймер и предупреждения о провале испытания ----------
 

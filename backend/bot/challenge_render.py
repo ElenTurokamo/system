@@ -36,6 +36,7 @@ from bot.config import (
     ease_available,
     eased_target,
     failure_is_forgiven,
+    failure_stops_system,
     level_from_total_xp,
     settings,
 )
@@ -171,7 +172,7 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
         if challenge.get("eased"):
             text += f"\n\n{EASED_CARD_NOTE}"
         if _physical_photo_pending(challenge, progress_rows):
-            text += "\n\n📸 Пришли фото выполнения всех физических активностей."
+            text += "\n\n📸 Пришли фото, видео или кружок выполнения всех физических активностей."
 
         cheer_line = await _build_cheer_line(challenge["id"])
         if cheer_line:
@@ -193,14 +194,11 @@ async def _build_text(challenge: dict, progress_rows: list[dict]) -> str:
         if user:
             lines.append(f"🔥 Стрик: {user['streak']} · 🏆 Уровень {user['level']} ({user['xp']} XP)")
         if status == "completed_with_photo":
-            lines.append("📸 Фото сохранено.")
+            lines.append("📸 Отчёт сохранён.")
         return quest + _join(lines)
 
     if status == "gave_up":
-        lines.append(
-            f"🏳 Испытание прервано. Штраф на {settings.penalty_hours}ч: "
-            "без игр, контента 18+ и спонтанных действий."
-        )
+        lines.append("🏳 Испытание прервано.")
         return quest + _join(lines)
 
     if status == "expired":
@@ -533,16 +531,19 @@ async def maybe_send_failure_warning(bot: Bot, challenge: dict) -> bool:
     user_id = challenge["user_id"]
     await clear_warning_message(bot, challenge["id"])  # предыдущее предупреждение (60 -> 30 -> 15)
 
-    # Если провал, который грозит сейчас, был бы ПЕРВЫМ подряд - он простится (серия
-    # замораживается, штрафа нет): предупреждение не должно пугать карой, которой не будет
-    # (и, наоборот, обязано честно описать полную кару, когда прощения уже нет).
+    # Что грозит, зависит от того, каким по счёту подряд будет этот провал: первый - серия
+    # заморозится (штрафа нет), тот, что замораживает Систему - штрафа нет, Система
+    # заморозится, остальные - штраф. Предупреждение не должно пугать карой, которой не будет.
     user = await db.get_user(user_id)
-    frozen = failure_is_forgiven(int((user or {}).get("consecutive_failures") or 0) + 1)
+    next_count = int((user or {}).get("consecutive_failures") or 0) + 1
+    system_frozen = failure_stops_system(next_count)
+    frozen = failure_is_forgiven(next_count)
     text = tx.challenge_warning(
         threshold,
         xp_loss=settings.missed_day_xp_penalty,
         penalty_hours=settings.penalty_hours,
         frozen=frozen,
+        system_frozen=system_frozen,
     )
     try:
         # Обычное уведомление (со звуком) - это именно та ситуация, ради которой

@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS challenges (
     bonus_claimed   INTEGER DEFAULT 0,  -- секретный бонус х2 (на ВСЕ дисциплины сразу) получен
     physical_photo_done   INTEGER DEFAULT 0,  -- фото по физической части получено/пропущено
     physical_photo_posted INTEGER DEFAULT 0,  -- фото реально ушло в группу (при завершении испытания)
-    physical_photo_file_id TEXT,              -- file_id полученного фото: хранится до завершения, в группу уходит только с отчётом
+    physical_photo_file_id TEXT,              -- file_id полученного медиа (фото/видео/кружок): хранится до завершения, в группу уходит только с отчётом
+    physical_media_type   TEXT,               -- тип медиа отчёта: photo / video / video_note (NULL у старых строк = photo)
     eased           INTEGER DEFAULT 0,  -- сложность в этот день понижена (цели и награда x1/2, секретное испытание недоступно)
     started_at      TEXT,
     completed_at    TEXT,
@@ -224,6 +225,7 @@ class Database:
             "physical_photo_done": "INTEGER DEFAULT 0",
             "physical_photo_posted": "INTEGER DEFAULT 0",
             "physical_photo_file_id": "TEXT",
+            "physical_media_type": "TEXT",  # photo / video / video_note (NULL = photo, см. store_physical_photo)
             "warned_minutes": "INTEGER",
             "warning_message_id": "INTEGER",
             "eased": "INTEGER DEFAULT 0",  # сложность в этот день понижена (см. ease_challenge)
@@ -825,19 +827,25 @@ class Database:
         )
         await self._conn.commit()
 
-    async def store_physical_photo(self, challenge_id: int, file_id: str) -> bool:
+    async def store_physical_photo(
+        self, challenge_id: int, file_id: str, media_type: str = "photo"
+    ) -> bool:
         """
-        Сохраняет фото выполнения физических дисциплин. В группу оно НЕ уходит сразу:
-        отчёт (с фото) публикуется только при завершении испытания (bot/completion.py).
+        Сохраняет медиа-отчёт о выполнении физических дисциплин: фото, видео или кружок
+        (media_type: "photo" | "video" | "video_note"). В группу оно НЕ уходит сразу: отчёт
+        публикуется только при завершении испытания (bot/completion.py).
 
-        Условный UPDATE (фото ещё не получено и не пропущено) делает сохранение атомарным:
-        два фото, пришедшие почти одновременно (альбом), не перезапишут друг друга, а фото
-        после «Пропустить фото» игнорируется. True - фото сохранено именно этим вызовом.
+        Условный UPDATE (отчёт ещё не получен и не пропущен) делает сохранение атомарным:
+        два файла, пришедшие почти одновременно (альбом), не перезапишут друг друга, а файл
+        после «Пропустить фото» игнорируется. True - сохранено именно этим вызовом.
         """
+        if media_type not in ("photo", "video", "video_note"):
+            raise ValueError(f"Неизвестный тип медиа: {media_type!r}")
         cur = await self._conn.execute(
-            "UPDATE challenges SET physical_photo_done = 1, physical_photo_file_id = ? "
+            "UPDATE challenges SET physical_photo_done = 1, physical_photo_file_id = ?, "
+            "physical_media_type = ? "
             "WHERE id = ? AND status = 'awaiting_action' AND COALESCE(physical_photo_done, 0) = 0",
-            (file_id, challenge_id),
+            (file_id, media_type, challenge_id),
         )
         await self._conn.commit()
         return cur.rowcount > 0

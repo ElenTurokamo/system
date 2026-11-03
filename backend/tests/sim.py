@@ -129,6 +129,24 @@ class FakeBot:
         self.log.append(("send_photo", chat_id, {"photo": photo, "caption": caption, **kw}))
         return Msg(self._id)
 
+    async def send_video(self, chat_id, video, caption=None, **kw):
+        self._check("send_video", chat_id, {"video": video, **kw})
+        self._id += 1
+        self.alive[(chat_id, self._id)] = caption or ""
+        self.born[(chat_id, self._id)] = Clock.now
+        self.log.append(("send_video", chat_id, {"video": video, "caption": caption, **kw}))
+        return Msg(self._id)
+
+    async def send_video_note(self, chat_id, video_note, **kw):
+        """Кружок: в Bot API у него нет подписи (параметра caption нет вовсе)."""
+        assert "caption" not in kw, "у video_note нет caption"
+        self._check("send_video_note", chat_id, {"video_note": video_note, **kw})
+        self._id += 1
+        self.alive[(chat_id, self._id)] = ""
+        self.born[(chat_id, self._id)] = Clock.now
+        self.log.append(("send_video_note", chat_id, {"video_note": video_note, **kw}))
+        return Msg(self._id)
+
     async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
         self._check("edit_message_text", chat_id, kw)
         if self._too_old(chat_id, message_id):
@@ -238,6 +256,7 @@ class Sim:
             await scheduler.expire_stale_challenges(self.bot)
             await scheduler.send_failure_warnings(self.bot)
             await scheduler.refresh_challenge_timers(self.bot)
+            await scheduler.cleanup_failure_messages(self.bot)   # в проде - раз в 30 секунд, тут шаг симуляции - минута
             if (Clock.now.minute % 10) == 0:   # как interval=10 минут в планировщике
                 await scheduler.refresh_stale_profiles(self.bot)
 

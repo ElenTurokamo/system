@@ -1,5 +1,5 @@
 """
-Политика провалов: заморозка серии на первом провале и полная кара на втором подряд.
+Политика провалов: лестница последствий за проваленные испытания подряд.
 
 Провалом считается и просрочка по таймауту, и "Сдаться" - оба пути вызывают
 apply_failure() ровно один раз на испытание (оба защищены условными UPDATE в
@@ -8,17 +8,19 @@ Database.expire_challenge / Database.give_up_challenge). Выполненное 
 
 Что происходит при провале (решает счётчик users.consecutive_failures ПОСЛЕ этого провала):
 
-  * ПЕРВЫЙ подряд (config.failure_is_forgiven) - заморозка серии. Игрок не штрафуется:
-    XP не снимается, ограничений нет, серия сохраняется, а в профиле вместо 🔥 показывается
-    🧊 (users.streak_frozen). Личная карточка и сообщение в группу сообщают о провале и о
-    том, что штраф не наложен. Выполнил следующее испытание - заморозка снимается, серия
-    растёт дальше.
-  * ВТОРОЙ подряд (и далее) - прежняя полная кара: -XP (MISSED_DAY_XP_PENALTY), серия
-    обнулена, ограничение доступа на PENALTY_HOURS (новые квесты не выдаются), а по достижении
-    AUTO_STOP_AFTER_FAILURES Система останавливается (тот же флаг users.is_stopped, что и у
-    ручной /stop: квесты не выдаются, пока игрок не наберёт /start).
+  * 1-й подряд (config.failure_is_forgiven) - заморозка серии. Игрок не штрафуется: XP не
+    снимается, ограничений нет, серия сохраняется, а в профиле вместо 🔥 показывается 🧊
+    (users.streak_frozen). Выполнил следующее испытание - заморозка снимается.
+  * 2-й подряд (и любой промежуточный до порога заморозки Системы) - штраф: -XP
+    (MISSED_DAY_XP_PENALTY), серия обнулена, новые испытания не выдаются PENALTY_HOURS часов.
+    Система при этом НЕ останавливается.
+  * N-й подряд, где N = AUTO_STOP_AFTER_FAILURES (по умолчанию 3) (config.failure_stops_system) -
+    Система замораживается (флаг users.is_stopped, как у ручной /stop: испытания не приходят,
+    пока игрок не наберёт /start). Штраф на этом провале НЕ накладывается: ни XP, ни
+    ограничения. В профиле дописывается строка о заморозке Системы.
 
-При AUTO_STOP_AFTER_FAILURES=1 прощения нет - каждый провал полный (см. failure_is_forgiven).
+При AUTO_STOP_AFTER_FAILURES=1 первый же провал замораживает Систему (без заморозки серии);
+при =2 лестница короче: 1-й - заморозка серии, 2-й - заморозка Системы, штрафа нет.
 """
 import logging
 from dataclasses import dataclass
@@ -27,7 +29,7 @@ from aiogram import Bot
 
 from bot import challenge_render, profile
 from bot import messages as tx
-from bot.config import failure_is_forgiven, settings
+from bot.config import failure_is_forgiven, failure_stops_system, settings
 from bot.database import db
 from bot.utils import call_with_retries
 
@@ -39,13 +41,14 @@ class FailureOutcome:
     """Итог применения провала (для логов, тестов и вызывающего кода)."""
 
     forgiven: bool      # True - первый провал подряд: серия заморожена, штрафа нет
-    streak: int         # серия: сохранённая (forgiven) либо потерянная (полная кара)
-    auto_stopped: bool  # Система остановлена этим провалом
+    streak: int         # серия: сохранённая (forgiven/заморозка Системы) либо потерянная (штраф)
+    auto_stopped: bool  # Система заморожена этим провалом (без штрафа)
+    penalized: bool = False  # True - наложен штраф (-XP, серия обнулена, ограничение доступа)
 
 
 async def _auto_stop_if_needed(user_id: int, count: int) -> bool:
-    """Останавливает Систему, если проваленных подряд стало порог или больше. True - остановлена этим вызовом."""
-    if count < settings.auto_stop_after_failures:
+    """Замораживает Систему, если проваленных подряд стало порог или больше. True - заморожена этим вызовом."""
+    if not failure_stops_system(count):
         return False
 
     user = await db.get_user(user_id)
@@ -80,9 +83,9 @@ async def apply_failure(
     тогда дубля не будет.
 
     Порядок: статистика дня -> счётчик подряд проваленных (атомарный +1) -> по его значению
-    либо заморозка серии (первый провал подряд), либо полная кара (второй и далее) ->
-    личная карточка игроку -> сообщение в группу -> профиль. Сообщение в группу идёт до
-    профиля: профиль при сбоях edit ждёт повторов, и друзья не должны ждать из-за этого.
+    одна из трёх веток (заморозка серии / штраф / заморозка Системы) -> личное уведомление
+    игроку -> сообщение в группу -> профиль. Сообщение в группу идёт до профиля: профиль при
+    сбоях edit ждёт повторов, и друзья не должны ждать из-за этого.
     """
     user = await db.get_user(user_id)
     streak_before = int((user or {}).get("streak") or 0)
@@ -90,32 +93,40 @@ async def apply_failure(
     await db.record_daily_stats(challenge_id)
     count = await db.register_failure(user_id)
 
-    if failure_is_forgiven(count):
-        # Заморозка: серия остаётся как есть, XP и доступ не трогаются.
+    if failure_stops_system(count):
+        # Заморозка Системы: штрафа нет (ни XP, ни ограничения), серия не трогается (после
+        # штрафа за 2-й провал она и так нулевая). Флаг ставится до профиля, чтобы профиль
+        # сразу показал строку о заморозке.
+        auto_stopped = await _auto_stop_if_needed(user_id, count)
+        outcome = FailureOutcome(
+            forgiven=False, streak=streak_before, auto_stopped=auto_stopped, penalized=False
+        )
+        card_text = tx.challenge_failed_system_frozen(reason)
+        logger.info(
+            "Провал испытания %s игрока %s: Система заморожена без штрафа (подряд: %s)",
+            challenge_id, user_id, count,
+        )
+    elif failure_is_forgiven(count):
+        # Заморозка серии: серия остаётся как есть, XP и доступ не трогаются.
         await db.set_streak_frozen(user_id, True)
         outcome = FailureOutcome(forgiven=True, streak=streak_before, auto_stopped=False)
-        card_text = tx.challenge_failed_frozen(
-            reason,
-            streak=streak_before,
-            xp_loss=settings.missed_day_xp_penalty,
-            penalty_hours=settings.penalty_hours,
-        )
+        card_text = tx.challenge_failed_frozen(reason, streak=streak_before)
         logger.info(
             "Провал испытания %s игрока %s прощён: серия %s заморожена (подряд: %s)",
             challenge_id, user_id, streak_before, count,
         )
     else:
-        # Полная кара: -XP (с понижением уровня, если сгорает весь запас XP текущего уровня),
-        # обнуление серии (заодно снимает заморозку) и ограничение на PENALTY_HOURS часов -
-        # оно показывается в профиле (profile.penalty_block) и обновляется там каждую минуту
-        # (scheduler.refresh_penalty_profiles). Пока ограничение действует, новые испытания не
-        # выдаются (dispatch._process_locked).
+        # Штраф: -XP (с понижением уровня, если сгорает весь запас XP текущего уровня),
+        # обнуление серии (заодно снимает заморозку) и приостановка новых испытаний на
+        # PENALTY_HOURS часов - она показывается в профиле (profile.penalty_block) и
+        # обновляется там каждую минуту (scheduler.refresh_penalty_profiles). Пока штраф
+        # действует, новые испытания не выдаются (dispatch._process_locked).
         await db.reset_streak(user_id)
         await db.add_xp(user_id, -settings.missed_day_xp_penalty)
         await db.set_penalty(user_id, settings.penalty_hours)
-        # Автостоп - до профиля, чтобы профиль уже показал паузу.
-        auto_stopped = await _auto_stop_if_needed(user_id, count)
-        outcome = FailureOutcome(forgiven=False, streak=streak_before, auto_stopped=auto_stopped)
+        outcome = FailureOutcome(
+            forgiven=False, streak=streak_before, auto_stopped=False, penalized=True
+        )
         card_text = tx.challenge_failed(
             reason, xp_loss=settings.missed_day_xp_penalty, penalty_hours=settings.penalty_hours
         )
@@ -124,9 +135,10 @@ async def apply_failure(
     await post_failure_report(
         bot,
         user_id,
-        streak_lost=0 if outcome.forgiven else outcome.streak,
+        streak_lost=outcome.streak if outcome.penalized else 0,
         forgiven=outcome.forgiven,
         streak_saved=outcome.streak if outcome.forgiven else 0,
+        system_frozen=failure_stops_system(count),
     )
     await profile.sync_profile_message(bot, user_id)
     return outcome
@@ -139,6 +151,7 @@ async def post_failure_report(
     streak_lost: int = 0,
     forgiven: bool = False,
     streak_saved: int = 0,
+    system_frozen: bool = False,
 ) -> None:
     """
     Дополнительное сообщение в привязанную группу о провале испытания (таймаут или
@@ -148,7 +161,9 @@ async def post_failure_report(
       * forgiven=False - игрок потерпел поражение, наложен штраф, серия сброшена;
         streak_lost - серия ДО сброса (messages.group_failure_report);
       * forgiven=True - первый провал подряд: штрафа нет, серия заморожена;
-        streak_saved - сохранённая серия (messages.group_failure_frozen_report).
+        streak_saved - сохранённая серия (messages.group_failure_frozen_report);
+      * system_frozen=True - провал, на котором замораживается Система: штрафа нет
+        (messages.group_failure_system_frozen_report).
 
     Вызывать ровно из тех мест, где сработал условный UPDATE провала (apply_failure) - тогда
     дубля не будет. Любой сбой только логируется: кара/заморозка уже применены, и
@@ -159,7 +174,9 @@ async def post_failure_report(
         if not user or not user.get("group_id"):
             return
         group_id = user["group_id"]
-        if forgiven:
+        if system_frozen:
+            text = tx.group_failure_system_frozen_report(user_id)
+        elif forgiven:
             text = tx.group_failure_frozen_report(user_id, streak_saved=streak_saved)
         else:
             text = tx.group_failure_report(

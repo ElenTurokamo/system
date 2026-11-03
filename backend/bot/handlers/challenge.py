@@ -106,16 +106,33 @@ async def on_amount_logged(message: Message):
     await profile.sync_profile_message(message.bot, message.from_user.id)
 
 
-@router.message(F.photo)
+def _extract_report_media(message: Message) -> tuple[str, str] | None:
+    """
+    (file_id, тип) медиа-отчёта из сообщения: фото, видео или кружок (video_note).
+    Для фото берётся самый большой размер. None - в сообщении нет подходящего медиа.
+    """
+    if message.photo:
+        return message.photo[-1].file_id, "photo"
+    if message.video:
+        return message.video.file_id, "video"
+    if message.video_note:
+        return message.video_note.file_id, "video_note"
+    return None
+
+
+@router.message(F.chat.type == "private", F.photo | F.video | F.video_note)
 async def on_photo_received(message: Message, bot):
     """
-    Фото запрашивается СРАЗУ, как только закрыты все физические цели дня -
-    не дожидаясь интеллектуальных и не дожидаясь нажатия "Завершить испытание".
-    Для чисто интеллектуальных испытаний это сообщение просто ни на что не среагирует.
+    Медиа-отчёт (фото, видео или кружок) запрашивается СРАЗУ, как только закрыты все
+    физические цели дня - не дожидаясь интеллектуальных и не дожидаясь нажатия
+    "Завершить испытание". Для чисто интеллектуальных испытаний это сообщение просто ни на
+    что не среагирует.
 
-    В группу фото при этом НЕ отправляется: оно только сохраняется (file_id в БД) и уходит
-    вместе с отчётом лишь после завершения испытания - вручную или автоматически
-    (см. bot/completion.py). Сдача/провал фото в группу не отправляют вовсе.
+    В группу отчёт при этом НЕ отправляется: он только сохраняется (file_id и тип в БД) и
+    уходит вместе с отчётом лишь после завершения испытания - вручную или автоматически
+    (см. bot/completion.py). Сдача/провал медиа в группу не отправляют вовсе.
+
+    Только личный чат: фото/видео игрока в группе не должны съедаться как отчёт.
     """
     challenge = await db.get_active_challenge(message.from_user.id)
     if not challenge or challenge["physical_photo_done"]:
@@ -124,11 +141,16 @@ async def on_photo_received(message: Message, bot):
     progress_rows = await db.get_progress_rows(challenge["id"])
     physical_rows = [r for r in progress_rows if FOCUS_OPTIONS[r["focus"]]["kind"] == "physical"]
     if not physical_rows or not all(r["completed"] for r in physical_rows):
-        return  # фото сейчас не ожидается
+        return  # медиа сейчас не ожидается
 
-    # Условный UPDATE: если два фото пришли разом (альбом) или фото опоздало за
-    # "Пропустить фото"/завершением - сохранится только первое, остальные игнорируются.
-    if not await db.store_physical_photo(challenge["id"], message.photo[-1].file_id):
+    media = _extract_report_media(message)
+    if media is None:
+        return
+    file_id, media_type = media
+
+    # Условный UPDATE: если два файла пришли разом (альбом) или файл опоздал за
+    # "Пропустить фото"/завершением - сохранится только первый, остальные игнорируются.
+    if not await db.store_physical_photo(challenge["id"], file_id, media_type):
         return
 
     try:

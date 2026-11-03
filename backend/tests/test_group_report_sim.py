@@ -643,7 +643,7 @@ def test_give_up_failure_sends_group_message_with_lost_streak_and_card_to_player
         await give_up_flow(s, ch)
         assert group_texts(s) == [_expected_failure(1, 1)]
         assert "Серия из 1 дня: сброшена" in group_texts(s)[0]
-        personal = [kw["text"] for kw in s.bot.sent("send_message", 1) if "ПРОВАЛЕН" in kw["text"]]
+        personal = [kw["text"] for kw in s.bot.sent("send_message", 1) if "Ежедневное испытание провалено" in kw["text"]]
         assert len(personal) == 1                                    # личная карточка провала по-прежнему приходит
     sim.run(sc)
 
@@ -695,7 +695,7 @@ def test_group_down_during_failure_still_applies_penalty_card_and_profile():
         u = await user(s)
         assert await status_of(s, ch["id"]) == "expired"
         assert (u["xp"], u["streak"], u["consecutive_failures"]) == (200, 0, 2) and u["penalty_until"]
-        assert any("ПРОВАЛЕН" in kw["text"] for kw in s.bot.sent("send_message", 1))
+        assert any("Ежедневное испытание провалено" in kw["text"] for kw in s.bot.sent("send_message", 1))
         assert group_texts(s) == []
     sim.run(sc)
 
@@ -781,9 +781,9 @@ def test_two_failures_in_a_row_send_two_messages_and_auto_stop_still_works():
         await s.until(t(8, 5, day=23))                               # штрафа нет - квест приходит в обычное время
         ch2 = await s.db.get_active_challenge(1)
         assert ch2 and ch2["id"] != ch["id"]
-        await give_up_flow(s, ch2)                                   # провал 2: полная кара + автостоп
+        await give_up_flow(s, ch2)                                   # провал 2: штраф, Система продолжает работать
         u = await user(s)
-        assert u["is_stopped"] and u["consecutive_failures"] == 2
+        assert not u["is_stopped"] and u["consecutive_failures"] == 2
         assert (u["streak"], u["streak_frozen"], u["xp"]) == (0, 0, 4700) and u["penalty_until"]
         reports = failure_reports(s)
         assert len(reports) == 2

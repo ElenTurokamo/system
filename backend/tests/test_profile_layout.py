@@ -50,7 +50,7 @@ def test_profile_stop_and_penalty_between_footer_and_done():
     text = profile.render_profile_text(
         _user(is_stopped=1, penalty_until=until), quest_done_today=True, eased_today=True
     )
-    i = [text.index(x) for x in ("Группа:", "Система остановлена", "Вы не выполнили требование", "Вы выполнили сегодняшний")]
+    i = [text.index(x) for x in ("Группа:", "Штраф: новые испытания приостановлены", "Вы выполнили сегодняшний", "Система заморожена")]
     assert i == sorted(i)
     assert "До снятия: 47 ч 2" in text or "До снятия: 47 ч 3" in text
     assert "Смотреть контент" not in text and text.count("🚫") == 1

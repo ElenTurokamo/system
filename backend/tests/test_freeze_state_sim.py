@@ -1,7 +1,8 @@
 """
 Симуляции двух доработок:
   1) заморозка серии: первый провал подряд прощается (🧊 вместо 🔥, сообщение о провале в группу,
-     без штрафа и ограничения), полная кара - на втором провале подряд;
+     без штрафа и ограничения), штраф - на втором провале подряд (Система при этом не
+     останавливается), заморозка Системы без штрафа - на третьем (см. test_failure_ladder_sim.py);
   2) дополнительная локальная БД состояния (bot/state_store.py): ключи сообщений профиля и
      отчёта о провале переживают откат db.sql из бэкапа, автоудаление - перезапуск, кэш
      file_id гайда - перезапуск и замену файла.
@@ -33,7 +34,8 @@ from tests.test_completion_guide_sim import (
 )
 from tests.test_group_report_sim import failure_reports, give_up_flow, user
 
-FREEZE_MARK = "Сработала защита серии 🧊"
+FREEZE_MARK = "Сработала защита серии 🧊"      # так выглядит сообщение о заморозке серии в ГРУППЕ
+CARD_FREEZE_MARK = "🧊 Ваша серия была заморожена."                    # а так - личное уведомление игроку
 
 
 async def set_user(s, **cols):
@@ -43,7 +45,7 @@ async def set_user(s, **cols):
 
 
 def personal_failure_cards(s, uid=1):
-    return [kw["text"] for kw in s.bot.sent("send_message", uid) if "ПРОВАЛЕН" in kw["text"]]
+    return [kw["text"] for kw in s.bot.sent("send_message", uid) if "Ежедневное испытание провалено" in kw["text"]]
 
 
 def warnings_for(s, uid=1):
@@ -59,10 +61,14 @@ def test_failure_helper_rules():
     assert failure_is_forgiven(1) is True
     assert failure_is_forgiven(2) is False and failure_is_forgiven(3) is False
     assert failure_is_forgiven(0) is False                      # провала ещё не было
+    from bot.config import failure_stops_system
+    assert [failure_stops_system(n) for n in (0, 1, 2, 3, 4)] == [False, False, False, True, True]  # порог по умолчанию - 3
     old = settings.auto_stop_after_failures
     try:
-        settings.auto_stop_after_failures = 1                   # любой провал останавливает Систему - прощения нет
-        assert failure_is_forgiven(1) is False
+        settings.auto_stop_after_failures = 1                   # первый же провал замораживает Систему - прощения нет
+        assert failure_is_forgiven(1) is False and failure_stops_system(1) is True
+        settings.auto_stop_after_failures = 2                   # короткая лестница: заморозка серии -> заморозка Системы
+        assert failure_is_forgiven(1) is True and failure_is_forgiven(2) is False and failure_stops_system(2) is True
         settings.auto_stop_after_failures = 5
         assert failure_is_forgiven(1) is True and failure_is_forgiven(2) is False
     finally:
@@ -82,8 +88,8 @@ def test_first_timeout_failure_freezes_streak_without_penalty():
         assert u["penalty_until"] is None and not u["is_stopped"]
         # Игроку - одна карточка провала в «замороженном» варианте.
         cards = personal_failure_cards(s)
-        assert len(cards) == 1 and FREEZE_MARK in cards[0] and "Серия из 6 дней: заморожена" in cards[0]
-        assert "Штраф и ограничения: не наложены" in cards[0] and "Наложена кара" not in cards[0]
+        assert len(cards) == 1 and CARD_FREEZE_MARK in cards[0]
+        assert "XP" not in cards[0] and "штраф" not in cards[0] and "Система" not in cards[0].replace("Системы", "")
         # В группу - ровно одно сообщение о поражении, тоже без штрафа.
         reports = failure_reports(s)
         assert len(reports) == 1 and FREEZE_MARK in reports[0]
@@ -91,7 +97,7 @@ def test_first_timeout_failure_freezes_streak_without_penalty():
         assert "Опыт: −" not in reports[0] and "Ограничение доступа" not in reports[0]
         # Профиль: кубик льда вместо огня, блока штрафа нет.
         text = await profile_text(s, 1)
-        assert "🧊 Серия: 6 дней" in text and "🔥" not in text and "Вы не выполнили требование" not in text
+        assert "🧊 Серия: 6 дней" in text and "🔥" not in text and "Штраф" not in text
     sim.run(sc)
 
 
@@ -117,7 +123,8 @@ def test_first_failure_with_zero_streak_is_forgiven_and_text_omits_streak_line()
         assert (u["xp"], u["streak"], u["consecutive_failures"], u["penalty_until"]) == (0, 0, 1, None)
         report = failure_reports(s)[0]
         assert FREEZE_MARK in report and "Серия из" not in report and "Штраф и ограничения: не наложены" in report
-        assert "Серия из" not in personal_failure_cards(s)[0]
+        card = personal_failure_cards(s)[0]
+        assert CARD_FREEZE_MARK in card
     sim.run(sc)
 
 
@@ -153,15 +160,16 @@ def test_second_failure_in_a_row_gets_the_full_penalty_and_clears_freeze():
         assert await status_of(s, ch2["id"]) == "expired"
         u = await user(s)
         assert (u["xp"], u["streak"], u["streak_frozen"], u["consecutive_failures"]) == (500, 0, 0, 2)
-        assert u["penalty_until"] and u["is_stopped"]                 # штраф + автостоп (порог 2)
+        assert u["penalty_until"] and not u["is_stopped"]             # штраф есть, Система НЕ останавливается
         reports = failure_reports(s)
         assert len(reports) == 2
         assert FREEZE_MARK in reports[0]
         assert "Серия из 4 дней: сброшена" in reports[1] and "Опыт: −300 XP" in reports[1] and FREEZE_MARK not in reports[1]
         cards = personal_failure_cards(s)
-        assert FREEZE_MARK in cards[0] and "Наложена кара" in cards[1]
+        assert CARD_FREEZE_MARK in cards[0] and "🚫 На вас был наложен штраф." in cards[1]
         text = await profile_text(s, 1)
-        assert "🔥 Серия: 0 дней" in text and "🧊" not in text and "Вы не выполнили требование" in text
+        assert "🔥 Серия: 0 дней" in text and "🧊" not in text
+        assert "🚫 Штраф: новые испытания приостановлены." in text and "Система заморожена" not in text
     sim.run(sc)
 
 
@@ -203,9 +211,10 @@ def test_no_grace_when_auto_stop_threshold_is_one():
         await set_user(s, xp=500, streak=3)
         await give_up_flow(s, ch)
         u = await user(s)
-        assert (u["xp"], u["streak"], u["streak_frozen"], u["consecutive_failures"]) == (200, 0, 0, 1)
-        assert u["penalty_until"] and u["is_stopped"]
-        assert FREEZE_MARK not in failure_reports(s)[0]
+        # Порог 1: первый же провал замораживает Систему, но штрафа на нём нет - XP и серия целы.
+        assert (u["xp"], u["streak"], u["streak_frozen"], u["consecutive_failures"]) == (500, 3, 0, 1)
+        assert u["penalty_until"] is None and u["is_stopped"]
+        assert FREEZE_MARK not in failure_reports(s)[0] and "Система заморожена" in failure_reports(s)[0]
     sim.run(sc, auto_stop_after_failures=1)
 
 
@@ -237,12 +246,13 @@ def test_no_double_freeze_on_double_click_or_timeout_race():
     sim.run(sc)
 
 
-def test_first_failure_warning_mentions_freeze_second_mentions_full_penalty():
+def test_warning_tells_which_consequence_the_next_failure_has():
+    """1-й провал грозит заморозкой серии, 2-й - штрафом, 3-й - заморозкой Системы (без штрафа)."""
     async def sc(s):
         await setup_quest(s)
         await s.until(t(1, 40, day=23))                               # до 02:00 меньше часа и меньше 30 минут
         w = warnings_for(s)
-        assert w and all("заморожена" in x and "Серия дней: обнулена" not in x for x in w)
+        assert w and all("серия будет заморожена 🧊" in x and "штраф" not in x for x in w)
     sim.run(sc)
 
     async def sc2(s):
@@ -250,8 +260,16 @@ def test_first_failure_warning_mentions_freeze_second_mentions_full_penalty():
         await set_user(s, consecutive_failures=1)
         await s.until(t(1, 40, day=23))
         w = warnings_for(s)
-        assert w and all("Серия дней: обнулена" in x and "Опыт: −300 XP" in x and "заморожена" not in x for x in w)
+        assert w and all("Система наложит штраф" in x and "заморожена" not in x for x in w)
     sim.run(sc2)
+
+    async def sc3(s):
+        await setup_quest(s)
+        await set_user(s, consecutive_failures=2)
+        await s.until(t(1, 40, day=23))
+        w = warnings_for(s)
+        assert w and all("Система будет заморожена ❄️" in x and "штраф" not in x for x in w)
+    sim.run(sc3)
 
 
 def test_manual_stop_and_start_keep_the_freeze_but_auto_stop_resume_clears_counter():
@@ -287,8 +305,6 @@ def test_friend_brief_shows_ice_too():
 def test_message_texts_fit_narrow_bubble_and_declension():
     from bot import messages as tx
     for text in (
-        tx.challenge_failed_frozen("timeout", 7, 300, 48),
-        tx.challenge_failed_frozen("gave_up", 0, 300, 48),
         tx.group_failure_frozen_report(42, 21),
         tx.group_failure_frozen_report(42, 0),
         tx.challenge_warning(15, 300, 48, frozen=True),
@@ -299,9 +315,10 @@ def test_message_texts_fit_narrow_bubble_and_declension():
     assert "Серия из" not in tx.group_failure_frozen_report(42, 0)
     divider_lines = [l for l in tx.group_failure_frozen_report(42, 5).splitlines() if set(l) == {"─"}]
     assert len(divider_lines) == 3
-    card = tx.challenge_failed_frozen("timeout", 1, 300, 48)
-    assert "снимет 300 XP" in card and "48 ч" in card
+    card = tx.challenge_failed_frozen("timeout", 1)
+    assert "Ваша серия была заморожена" in card and "XP" not in card
     assert tx.challenge_warning(30, 300, 48) != tx.challenge_warning(30, 300, 48, frozen=True)
+    assert tx.challenge_warning(30, system_frozen=True, frozen=True).count("заморожена") == 1
 
 
 def test_upgrade_adds_streak_frozen_column_to_old_database(tmp_path):

@@ -36,7 +36,13 @@ import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 
 from bot import messages as tx
 from bot.config import FOCUS_OPTIONS, level_from_total_xp, settings, time_of_day_short
@@ -67,10 +73,11 @@ def _ru_plural(n: int, one: str, few: str, many: str) -> str:
 
 def penalty_block(user: dict) -> str:
     """
-    Блок-уведомление о провале требования Системы: показывается, пока у игрока
-    активно ограничение (penalty_until в будущем). Встаёт последним пунктом
-    «хвоста» профиля (под блоком времени испытаний и группы - см. render_profile_text). Обратный отсчёт пересчитывается при каждом вызове, а сам профиль
-    перерисовывается раз в минуту планировщиком (см. scheduler.refresh_penalty_profiles).
+    Подпись о штрафе: показывается, пока у игрока активно ограничение (penalty_until в
+    будущем). Встаёт в «хвост» профиля (под блоком времени испытаний и группы - см.
+    render_profile_text). Две короткие строки: что происходит и сколько осталось.
+    Обратный отсчёт пересчитывается при каждом вызове, а сам профиль перерисовывается раз в
+    минуту планировщиком (см. scheduler.refresh_penalty_profiles).
     """
     penalty_until = user.get("penalty_until")
     if not penalty_until:
@@ -87,12 +94,15 @@ def penalty_block(user: dict) -> str:
     total_minutes = int(remaining.total_seconds() // 60)
     hours, minutes = divmod(total_minutes, 60)
 
-    # Короткий формат: что запрещено и сколько осталось до снятия.
     return (
-        f"🚫 Вы не выполнили требование системы. Ограничения на {settings.penalty_hours} ч: "
-        "без контента 18+ и видеоигр, новые испытания приостановлены.\n"
-        f"⏱ До снятия: {hours} ч {minutes} мин."
+        "🚫 Штраф: новые испытания приостановлены.\n"
+        f"⏱ До снятия: {hours} ч {minutes} мин"
     )
+
+
+# Строка о замороженной Системе - в самом конце профиля (см. render_profile_text). Одна и та же
+# для автозаморозки после трёх провалов подряд и для ручного /stop: выход один - /start.
+SYSTEM_FROZEN_LINE = f"{tx.SYSTEM_FROZEN_EMOJI} Система заморожена. Для активации отправьте /start."
 
 
 def player_code(user: dict) -> str:
@@ -273,16 +283,12 @@ def render_profile_text(
     text = f"{header}\n\n{stats}"
 
     # Порядок блоков под статистикой: 1) блок настроек (время испытаний и группа),
-    # 2) остановка Системы (/stop) и штраф за провал, 3) отметки о выполнении сегодняшнего
-    # квеста - они всегда САМЫЕ нижние (пропадают сами, как только диспетчер создаст новое
-    # испытание на следующий день - см. sync/resend_profile_message).
+    # 2) подпись о штрафе, 3) отметки о выполнении сегодняшнего квеста (пропадают сами, как
+    # только диспетчер создаст новое испытание на следующий день), 4) САМЫЙ КОНЕЦ - строка о
+    # заморозке Системы (/stop или автозаморозка): она держится, пока игрок не наберёт /start
+    # (см. handlers/start.py::cmd_start, там же снимается is_stopped) - до этого момента
+    # ежедневные испытания ему не создаются (см. Database.get_users_by_time).
     tail: list[str] = []
-    if user.get("is_stopped"):
-        # Держится, пока игрок не наберёт /start (см. handlers/start.py::cmd_start,
-        # там же снимается is_stopped) - до этого момента ежедневные испытания
-        # ему не создаются (см. Database.get_users_by_time).
-        tail.append("⏸ Система остановлена. Ежедневные испытания не приходят. Наберите /start, чтобы возобновить.")
-
     penalty_text = penalty_block(user)
     if penalty_text:
         tail.append(penalty_text)
@@ -301,24 +307,35 @@ def render_profile_text(
         text += "\n\n" + "\n".join(tail)
     if done:
         text += "\n\n" + "\n".join(done)
+    if user.get("is_stopped"):
+        text += f"\n\n{SYSTEM_FROZEN_LINE}"
     return text
 
 
 async def clear_failure_message(bot: Bot, user: dict):
     """
-    Удаляет предыдущее сообщение-отчёт о провале испытания (если оно есть) -
-    вызывается диспетчером при выдаче нового ежедневного квеста (см.
-    scheduler.dispatch_daily_challenges), чтобы отчёты о провалах не копились
-    в чате. Подпись о штрафе в самом профиле (penalty_block) при этом НЕ
-    трогается - она держится по penalty_until независимо от смены испытаний.
+    Удаляет уведомление о провале испытания (если оно ещё в чате). Вызывается:
+      * планировщиком через settings.failure_message_ttl_minutes (5 минут) после отправки -
+        см. scheduler.cleanup_failure_messages;
+      * диспетчером при выдаче нового ежедневного квеста (раньше срока), чтобы уведомления
+        не копились в чате.
+    Подпись о штрафе в самом профиле (penalty_block) при этом НЕ трогается - она держится по
+    penalty_until независимо от уведомления.
+
+    Запись о сообщении снимается, когда его больше нет (удалено, уже удалено игроком, слишком
+    старое, бот заблокирован). При ВРЕМЕННОМ сбое (сеть, flood-control, 5xx) запись остаётся -
+    следующий тик планировщика попробует снова, иначе уведомление застряло бы в чате навсегда.
     """
     if not user.get("failure_message_id"):
         return
     chat_id = user.get("failure_chat_id") or user["user_id"]
     try:
         await bot.delete_message(chat_id, user["failure_message_id"])
+    except (TelegramRetryAfter, TelegramNetworkError, TelegramServerError) as e:
+        logger.info("Не удалось удалить уведомление о провале %s (повторю позже): %s", user["user_id"], e)
+        return
     except Exception as e:
-        logger.info("Не удалось удалить отчёт о провале %s: %s", user["user_id"], e)
+        logger.info("Не удалось удалить уведомление о провале %s: %s", user["user_id"], e)
     await db.clear_failure_message(user["user_id"])
 
 

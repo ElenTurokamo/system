@@ -150,81 +150,39 @@ _FAILURE_REASON_LINES = {
 }
 
 
-def challenge_failed(reason: str, xp_loss: int = 0, penalty_hours: int = 0) -> str:
-    """
-    Отдельная карточка-уведомление о провале дневного квеста - оформлена как
-    системное окно (рамка + фиксированная структура: статус / причина / кара),
-    в духе интерфейса Системы из Solo Leveling. Текст не заимствован из
-    оригинала (это нарушало бы авторские права) - только стилистика: холодный,
-    безличный тон, формулировки в стиле игрового лога, разбивка на статус и
-    последствия.
-
-    В отличие от большинства других сообщений бота, текст здесь ФИКСИРОВАН
-    (без банка случайных фраз, как и challenge_start/photo_caption) - это
-    официальное уведомление Системы, и ему не пристало звучать по-разному
-    от раза к разу.
-
-    reason: "timeout" (испытание сгорело по таймауту) или "gave_up" (игрок
-    сдался сам) - меняется только строка причины, остальная карточка едина
-    для обоих случаев провала.
-
-    Само сообщение автоматически удаляется через settings.failure_message_ttl_minutes
-    после отправки (см. scheduler.cleanup_failure_messages), а также раньше -
-    как только выдан новый ежедневный квест (см. profile.clear_failure_message).
-    """
-    reason_line = _FAILURE_REASON_LINES.get(reason, "Дневной квест провален.")
-    return (
-        "⚠ 『 Уведомление Системы 』 ⚠\n"
-        f"{SYSTEM_DIVIDER}\n"
-        "Статус квеста: ПРОВАЛЕН\n"
-        f"{reason_line}\n"
-        f"{SYSTEM_DIVIDER}\n"
-        "Наложена кара:\n"
-        f"▸ Опыт: −{xp_loss} XP\n"
-        "▸ Серия дней: обнулена\n"
-        f"▸ Ограничение доступа: {penalty_hours} ч\n"
-        f"{SYSTEM_DIVIDER}\n"
-        "Система не делает исключений для слабых.\n"
-        "Новый шанс появится вместе со следующим испытанием."
-    )
-
-
+# Эмодзи замороженной Системы (после серии провалов подряд) - см. profile.SYSTEM_FROZEN_LINE.
+SYSTEM_FROZEN_EMOJI = "❄️"
 # Эмодзи замороженной серии - то же, что в профиле вместо 🔥 (см. profile.streak_emoji).
 FREEZE_EMOJI = "🧊"
 
 
-def challenge_failed_frozen(
-    reason: str, streak: int = 0, xp_loss: int = 0, penalty_hours: int = 0
-) -> str:
+def _failure_card(consequence: str) -> str:
     """
-    Карточка-уведомление о ПЕРВОМ провале подряд: испытание провалено, но штраф не наложен -
-    серия заморожена (в профиле 🧊 вместо 🔥). Оформлена так же, как challenge_failed, и так
-    же ФИКСИРОВАНА. Заодно предупреждает, чем обернётся следующий провал подряд (xp_loss и
-    penalty_hours - то, что будет наложено тогда).
+    Общий каркас личного уведомления о провале: заголовок, одна строка о провале и одна
+    строка о последствии. Больше ничего - уведомление читается с одного взгляда. Текст
+    ФИКСИРОВАН (без банка случайных фраз). Причина провала (таймаут/«Сдаться») в тексте
+    не указывается, параметр reason у функций ниже сохранён для совместимости вызова.
 
-    streak - сохранённая серия; при нулевой серии строка про неё не выводится (замораживать
-    нечего), но провал всё равно прощается.
+    Само сообщение автоматически удаляется через settings.failure_message_ttl_minutes (5 минут)
+    после отправки (scheduler.cleanup_failure_messages), а также раньше - как только выдан
+    новый ежедневный квест (profile.clear_failure_message).
     """
-    reason_line = _FAILURE_REASON_LINES.get(reason, "Дневной квест провален.")
-    lines = [
-        "⚠ 『 Уведомление Системы 』 ⚠",
-        SYSTEM_DIVIDER,
-        "Статус квеста: ПРОВАЛЕН",
-        reason_line,
-        SYSTEM_DIVIDER,
-        f"Сработала защита серии {FREEZE_EMOJI}",
-    ]
-    if streak > 0:
-        lines.append(f"▸ Серия из {_days_genitive(streak)}: заморожена")
-    lines += [
-        "▸ Штраф и ограничения: не наложены",
-        SYSTEM_DIVIDER,
-        "Это первый провал подряд — он прощён.",
-        f"Провал следующего испытания обнулит серию, снимет {xp_loss} XP "
-        f"и ограничит доступ на {penalty_hours} ч.",
-        "Выполни следующий квест — и серия продолжится.",
-    ]
-    return "\n".join(lines)
+    return f"『 Уведомление Системы 』\nЕжедневное испытание провалено.\n\n{consequence}"
+
+
+def challenge_failed(reason: str = "", xp_loss: int = 0, penalty_hours: int = 0) -> str:
+    """Уведомление о провале со ШТРАФОМ (2-й провал подряд). xp_loss/penalty_hours в тексте не выводятся."""
+    return _failure_card("🚫 На вас был наложен штраф.")
+
+
+def challenge_failed_frozen(reason: str = "", streak: int = 0) -> str:
+    """Уведомление о ПЕРВОМ провале подряд: штрафа нет, серия заморожена (в профиле 🧊 вместо 🔥)."""
+    return _failure_card(f"{FREEZE_EMOJI} Ваша серия была заморожена.")
+
+
+def challenge_failed_system_frozen(reason: str = "") -> str:
+    """Уведомление о провале, на котором ЗАМОРАЖИВАЕТСЯ Система (3-й подряд): штрафа нет."""
+    return _failure_card(f"{SYSTEM_FROZEN_EMOJI} Система была заморожена.")
 
 
 def _days_genitive(n: int) -> str:
@@ -287,6 +245,22 @@ def group_failure_frozen_report(user_id: int, streak_saved: int = 0) -> str:
     return "\n".join(lines)
 
 
+def group_failure_system_frozen_report(user_id: int) -> str:
+    """
+    Сообщение в привязанную группу о провале, на котором замораживается Система (3-й подряд):
+    игрок потерпел поражение, штрафа нет, Система заморожена до /start
+    (см. failure_policy.post_failure_report). Текст фиксирован.
+    """
+    return (
+        "⚠ 『 Уведомление Системы 』 ⚠\n"
+        f"{SYSTEM_DIVIDER}\n"
+        f"Игрок {user_id} потерпел поражение.\n"
+        "Дневной квест провален.\n"
+        f"{SYSTEM_DIVIDER}\n"
+        f"{SYSTEM_FROZEN_EMOJI} Система заморожена"
+    )
+
+
 def _warning_time_phrase(minutes: int) -> str:
     if minutes == 60:
         return "менее часа"
@@ -296,7 +270,11 @@ def _warning_time_phrase(minutes: int) -> str:
 
 
 def challenge_warning(
-    minutes: int, xp_loss: int = 0, penalty_hours: int = 0, frozen: bool = False
+    minutes: int,
+    xp_loss: int = 0,
+    penalty_hours: int = 0,
+    frozen: bool = False,
+    system_frozen: bool = False,
 ) -> str:
     """
     Предупреждение о скором провале дневного квеста: приходит отдельным
@@ -309,14 +287,19 @@ def challenge_warning(
     (а не "ровно N") честна и в том случае, если бот был недоступен и
     предупреждение ушло с небольшим опозданием.
 
-    frozen=True - провал, который грозит сейчас, был бы ПЕРВЫМ подряд и простился бы
-    (серия замораживается, штрафа нет): вместо «Система наложит штраф» - честное описание этого.
+    Что грозит при невыполнении, зависит от того, каким по счёту подряд будет этот провал:
+      * frozen=True - первый: серия заморозится, штрафа нет;
+      * system_frozen=True - тот, что замораживает Систему: штрафа нет, Система заморозится
+        (приоритетнее frozen);
+      * иначе - штраф.
     """
     phrase = _warning_time_phrase(minutes)
     # Короткий формат: только заголовок и одна строка - сколько осталось и что будет при
-    # невыполнении (xp_loss и penalty_hours в тексте больше не выводятся, но остаются в
+    # невыполнении (xp_loss и penalty_hours в тексте не выводятся, но остаются в
     # сигнатуре, чтобы не менять вызывающий код).
-    if frozen:
+    if system_frozen:
+        consequence = f"Система будет заморожена {SYSTEM_FROZEN_EMOJI}"
+    elif frozen:
         consequence = f"серия будет заморожена {FREEZE_EMOJI}"
     else:
         consequence = "Система наложит штраф"

@@ -101,7 +101,7 @@ def group_texts(s, group=GROUP):
 
 
 def failure_pushes(s, uid):
-    return [kw["text"] for kw in s.bot.sent("send_message", uid) if "ПРОВАЛЕН" in kw["text"]]
+    return [kw["text"] for kw in s.bot.sent("send_message", uid) if "Ежедневное испытание провалено" in kw["text"]]
 
 
 # ---------------------------------------------------------------- авто-завершение: основной сценарий
@@ -799,8 +799,7 @@ def test_dividers_are_short_enough_for_small_screens():
                  tx.challenge_failed("timeout", 300, 48), tx.challenge_failed("gave_up", 300, 48)):
         lines = text.split("\n")
         seps = [ln for ln in lines if ln and set(ln) == {"─"}]
-        assert len(seps) == 3
-        assert all(ln == tx.SYSTEM_DIVIDER for ln in seps)
+        assert seps == []                       # короткие уведомления без разделителей
         assert "─" * 13 not in text
 
 
